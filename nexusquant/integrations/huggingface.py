@@ -27,7 +27,7 @@ from typing import Optional, Any
 
 import torch
 
-from nexusquant.pipeline import NexusQuantSimple, NexusQuantMax, NexusQuantEvict
+from nexusquant.pipeline import NexusQuantSimple, NexusQuantMax, NexusQuantEvict, NexusQuantEvictTruncate
 from nexusquant.core.hadamard import hadamard_matrix
 from nexusquant.core.e8_lattice import E8Lattice
 from nexusquant.core.rope_utils import inverse_rope, forward_rope
@@ -485,9 +485,10 @@ def nexusquant_max(model, tokenizer, bits_per_dim: float = 2.0, **kwargs):
 # ---------------------------------------------------------------------------
 
 _EVICT_PRESETS = {
-    "high":     {"eviction_rate": 0.35, "bits": 2},  # ~10x, <1% PPL
-    "balanced": {"eviction_rate": 0.60, "bits": 2},  # ~16x at long ctx, <1% PPL
-    "max":      {"eviction_rate": 0.80, "bits": 2},  # ~33x, +2% PPL
+    "high":     {"eviction_rate": 0.35, "bits": 2, "key_bits": 3},         # K3V2, ~9x, <0.5% PPL (A100, 3544-tok)
+    "balanced": {"eviction_rate": 0.60, "bits": 2},                        # K2V2, ~17x at long ctx, <1% PPL
+    "max":      {"eviction_rate": 0.80, "bits": 2},                        # K2V2, ~33x, +2% PPL
+    "asym":     {"eviction_rate": 0.60, "bits": 2, "key_bits": 3},         # K3V2, ~14x, <1% PPL (asymmetric: 3-bit K, 2-bit V)
 }
 
 
@@ -499,20 +500,37 @@ def nexusquant_evict(
     sliding_window: int = 32,
     obs_window: int = 32,
     bits: int = 2,
+    key_bits: int = None,
+    value_bits: int = None,
+    truncate: bool = False,
+    scorer: str = "key-key",
+    input_ids=None,
+    protected_layers: set = None,
+    protect_boundary: int = 0,
+    min_context_for_compression: int = 0,
     verbose: bool = True,
 ):
     """Compress KV cache with attention-aware token eviction + E8 quantization.
 
     Intercepts the DynamicCache layer update, applies NexusQuantEvict once on
     the first prefill (seq_len > 1), and writes the compressed + eviction-masked
-    cache back in-place. The returned attention mask is stored on the compressor
-    and can be retrieved via the yielded ``nq_evict`` object as
-    ``nq_evict.last_mask``.
+    cache back in-place.
 
-    quality presets (override eviction_rate / bits):
-        "high":     eviction_rate=0.35, bits=2  (~10x compression, <1% PPL)
-        "balanced": eviction_rate=0.60, bits=2  (~16x at long ctx, <1% PPL)
-        "max":      eviction_rate=0.80, bits=2  (~33x, +2% PPL)
+    When truncate=False (default): evicted positions are zeroed and a float
+    attention mask is returned via compressor.last_mask. Pass this mask as
+    attention_mask when calling model.generate().
+
+    When truncate=True: evicted tokens are PHYSICALLY REMOVED from all KV tensors,
+    freeing real GPU memory and reducing attention FLOPs. RoPE is stripped at
+    original positions and re-applied at contiguous positions [0,1,...,n_kept-1].
+    The starting position for generation is stored in compressor.next_position.
+    Pass position_ids=torch.arange(next_pos, next_pos + max_new_tokens) to generate().
+
+    quality presets (override eviction_rate / bits / key_bits):
+        "high":     K3V2, eviction_rate=0.35  (~9x,  +0.35% PPL, A100 3544-tok)
+        "balanced": K2V2, eviction_rate=0.60  (~17x, +0.82% PPL, A10G 1664-tok)
+        "max":      K2V2, eviction_rate=0.80  (~33x, +2.13% PPL, A10G 1664-tok)
+        "asym":     K3V2, eviction_rate=0.60  (~14x, <1% PPL estimated — not fully validated end-to-end)
 
     Args:
         model: Any HuggingFace causal LM using DynamicCache.
@@ -520,39 +538,101 @@ def nexusquant_evict(
             is one of the named presets; set quality=None to use this directly).
         quality: Preset name ("high", "balanced", "max") or None to use raw args.
         sliding_window: Recent tokens always kept (never evicted).
-        obs_window: Number of recent positions used to score importance.
+        obs_window: Number of recent positions used to score importance (key-key only).
         bits: E8 quantization bits for surviving tokens (2 recommended).
+        truncate: If True, physically remove evicted tokens from KV tensors and
+            remap RoPE to contiguous positions. Saves real GPU memory and FLOPs.
+            Requires passing correct position_ids to model.generate(). Default False.
+        scorer: Importance scoring method.
+            "key-key" (default) -- SnapKV-style proxy using recent key vectors as
+                queries. Fast, no extra forward pass needed.
+            "real" -- Accumulated softmax weights from a dedicated prefill forward
+                pass with output_attentions=True. Requires:
+                  1. model loaded with attn_implementation='eager'
+                  2. input_ids passed to this context manager
+            Expected benefit over key-key: ~0.35pp at 80% eviction.
+        input_ids: Required when scorer="real". The (batch, seq) prefix token ids
+            used to run the importance-scoring forward pass before prefill hooks fire.
         verbose: Print stats on exit.
 
     Yields:
-        compressor (NexusQuantEvict): the active compressor instance.
-            Access compressor.last_mask for the (batch, seq) attention mask
-            after the first forward pass.
+        compressor (NexusQuantEvict or NexusQuantEvictTruncate): active compressor.
+            truncate=False: compressor.last_mask  — (batch, seq) float attention mask
+            truncate=True:  compressor.next_position — int, first position for generation
 
-    Example:
+    Example (masking, default):
         >>> with nexusquant_evict(model) as nq:
+        ...     output = model.generate(input_ids, max_new_tokens=200,
+        ...                             attention_mask=nq.last_mask)
+
+    Example (real attention scorer):
+        >>> model = AutoModelForCausalLM.from_pretrained(
+        ...     "mistralai/Mistral-7B-v0.1", attn_implementation="eager", ...
+        ... )
+        >>> with nexusquant_evict(model, scorer="real", input_ids=prefix_ids) as nq:
+        ...     output = model.generate(prefix_ids, max_new_tokens=200)
+
+    Example (truncation, real memory savings):
+        >>> with nexusquant_evict(model, truncate=True) as nq:
         ...     output = model.generate(input_ids, max_new_tokens=200)
-        >>> # nq.last_mask holds the prefix attention mask used during generation
     """
     # Apply quality preset if recognised
     if quality in _EVICT_PRESETS:
         preset = _EVICT_PRESETS[quality]
         eviction_rate = preset["eviction_rate"]
         bits = preset["bits"]
+        if key_bits is None and "key_bits" in preset:
+            key_bits = preset["key_bits"]
+        if value_bits is None and "value_bits" in preset:
+            value_bits = preset["value_bits"]
+
+    # Validate real-scorer requirements early so the user gets a clear error
+    if scorer == "real":
+        attn_impl = getattr(model.config, "_attn_implementation", None)
+        if attn_impl != "eager":
+            raise ValueError(
+                f"scorer='real' requires attn_implementation='eager' but model reports "
+                f"attn_implementation={attn_impl!r}. "
+                "SDPA suppresses attention weights silently. "
+                "Reload with: AutoModelForCausalLM.from_pretrained("
+                "..., attn_implementation='eager')"
+            )
+        if input_ids is None:
+            raise ValueError(
+                "scorer='real' requires input_ids to be passed to nexusquant_evict(). "
+                "These are the (batch, seq) token ids for the prefix."
+            )
 
     model_cfg = _detect_model_config(model)
     head_dim = model_cfg["head_dim"]
     rope_base = model_cfg["rope_base"]
 
-    compressor = NexusQuantEvict(
+    compressor_cls = NexusQuantEvictTruncate if truncate else NexusQuantEvict
+    compressor = compressor_cls(
         head_dim=head_dim,
         bits=bits,
+        key_bits=key_bits,
+        value_bits=value_bits,
         eviction_rate=eviction_rate,
         sliding_window=sliding_window,
         obs_window=obs_window,
         rope_base=rope_base,
+        scorer=scorer,
+        protected_layers=protected_layers,
+        protect_boundary=protect_boundary,
+        min_context_for_compression=min_context_for_compression,
     )
-    compressor.last_mask = None  # populated on first prefill
+    compressor.last_mask = None       # set on first prefill (masking path)
+    compressor.next_position = None   # set on first prefill (truncation path)
+
+    # For scorer="real": run the importance-scoring forward pass NOW (before the
+    # prefill hooks fire) so that the scores are ready when compress() is called
+    # inside the hook. We cache them on the compressor instance.
+    if scorer == "real":
+        _real_importance = compressor._score_importance_real(model, input_ids)
+        compressor._cached_real_importance = _real_importance
+    else:
+        compressor._cached_real_importance = None
 
     stats = _CompressionStats(bits=bits)
 
@@ -582,8 +662,26 @@ def nexusquant_evict(
                     self.value_cache = [v]
 
             single = _SingleLayerCache(keys, values)
-            _, mask = compressor.compress(single)
-            compressor.last_mask = mask
+
+            if scorer == "real" and compressor._cached_real_importance is not None:
+                # Inject pre-computed real importance by temporarily shadowing
+                # _score_importance on the instance so compress() uses them
+                # without triggering another forward pass.
+                cached_imp = compressor._cached_real_importance
+                compressor._score_importance = lambda k, _imp=cached_imp: _imp
+                result = compressor.compress(single)
+                del compressor._score_importance   # remove instance override
+            else:
+                result = compressor.compress(single)
+
+            if truncate:
+                # result = (cache, next_position_int)
+                _, next_pos = result
+                compressor.next_position = next_pos
+            else:
+                # result = (cache, attention_mask)
+                _, mask = result
+                compressor.last_mask = mask
 
             new_k = single.key_cache[0]
             new_v = single.value_cache[0]
@@ -600,10 +698,18 @@ def nexusquant_evict(
     DynamicSlidingWindowLayer.update = _make_evict_hook(original_dsw_update)
 
     if verbose:
+        mode_label = "truncate" if truncate else "mask"
         model_name = getattr(model.config, "_name_or_path", model.__class__.__name__)
+        _kb = compressor.key_bits
+        _vb = compressor.value_bits
+        bits_label = f"K={_kb}-bit/V={_vb}-bit E8" if _kb != _vb else f"{_kb}-bit E8"
+        boundary_label = f", protect_boundary={protect_boundary}" if protect_boundary else ""
+        ctx_label = f", min_ctx={min_context_for_compression}" if min_context_for_compression else ""
         print(
             f"NexusQuantEvict: activating on {model_name} "
-            f"(eviction={eviction_rate:.0%}, {bits}-bit E8, sliding_window={sliding_window})",
+            f"(eviction={eviction_rate:.0%}, {bits_label}, "
+            f"sliding_window={sliding_window}, mode={mode_label}, scorer={scorer}"
+            f"{boundary_label}{ctx_label})",
             flush=True,
         )
 

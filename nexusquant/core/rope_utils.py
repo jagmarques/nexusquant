@@ -69,6 +69,66 @@ def inverse_rope(keys: torch.Tensor, seq_offset: int = 0, base: float = 10000.0)
     return result
 
 
+def inverse_rope_at_positions(keys: torch.Tensor, positions: torch.Tensor, base: float = 10000.0) -> torch.Tensor:
+    """Remove RoPE from keys encoded at arbitrary (non-contiguous) positions.
+
+    Used when keys were encoded at positions like [0, 3, 7, 15] after eviction.
+    Unlike inverse_rope(), this accepts an explicit per-token position tensor.
+
+    Args:
+        keys: (heads, seq, dim) float tensor with RoPE already applied
+        positions: (seq,) long or float tensor of the original position for each token
+        base: RoPE frequency base
+
+    Returns:
+        Keys with RoPE removed at those positions, same shape (heads, seq, dim)
+    """
+    h, s, d = keys.shape
+    d_half = d // 2
+    inv_freq = 1.0 / (base ** (torch.arange(0, d, 2, dtype=torch.float32, device=keys.device) / d))
+    positions_f = positions.float().to(keys.device)
+    freqs = torch.outer(positions_f, inv_freq)     # (s, d_half)
+    cos_f = freqs.cos().to(keys.dtype)
+    sin_f = freqs.sin().to(keys.dtype)
+
+    first_half = keys[..., :d_half]
+    second_half = keys[..., d_half:]
+    result = keys.clone()
+    # inverse rotation: R^{-T}x = [x1*cos + x2*sin, -x1*sin + x2*cos]
+    result[..., :d_half] = first_half * cos_f + second_half * sin_f
+    result[..., d_half:] = -first_half * sin_f + second_half * cos_f
+    return result
+
+
+def forward_rope_at_positions(keys: torch.Tensor, positions: torch.Tensor, base: float = 10000.0) -> torch.Tensor:
+    """Apply RoPE to keys at arbitrary (non-contiguous) positions.
+
+    Used to re-encode keys at contiguous positions [0, 1, 2, ...] after truncation.
+
+    Args:
+        keys: (heads, seq, dim) float tensor with RoPE removed
+        positions: (seq,) long or float tensor of the target position for each token
+        base: RoPE frequency base
+
+    Returns:
+        Keys with RoPE applied at those positions, same shape (heads, seq, dim)
+    """
+    h, s, d = keys.shape
+    d_half = d // 2
+    inv_freq = 1.0 / (base ** (torch.arange(0, d, 2, dtype=torch.float32, device=keys.device) / d))
+    positions_f = positions.float().to(keys.device)
+    freqs = torch.outer(positions_f, inv_freq)     # (s, d_half)
+    cos_f = freqs.cos().to(keys.dtype)
+    sin_f = freqs.sin().to(keys.dtype)
+
+    first_half = keys[..., :d_half].clone()
+    second_half = keys[..., d_half:].clone()
+    result = keys.clone()
+    result[..., :d_half] = first_half * cos_f - second_half * sin_f
+    result[..., d_half:] = first_half * sin_f + second_half * cos_f
+    return result
+
+
 def forward_rope(keys: torch.Tensor, seq_offset: int = 0, base: float = 10000.0) -> torch.Tensor:
     """Re-apply RoPE to key vectors (split-half style).
 

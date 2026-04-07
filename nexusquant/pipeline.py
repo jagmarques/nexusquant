@@ -16,7 +16,7 @@ from typing import Optional, Dict, Any
 from nexusquant.core.e8_lattice import E8Lattice
 from nexusquant.core.hadamard import hadamard_matrix
 from nexusquant.core.dp_allocator import dp_bit_allocation
-from nexusquant.core.rope_utils import inverse_rope, forward_rope
+from nexusquant.core.rope_utils import inverse_rope, forward_rope, inverse_rope_at_positions, forward_rope_at_positions
 from nexusquant.core.token_merger import merge_and_drop
 from nexusquant.core.mp_threshold import mp_signal_dims, adaptive_dim_budget
 
@@ -436,27 +436,60 @@ class NexusQuantEvict:
         self,
         head_dim: int = 128,
         bits: int = 2,
+        key_bits: int = None,
+        value_bits: int = None,
         eviction_rate: float = 0.6,
         sliding_window: int = 32,
         obs_window: int = 32,
         rope_base: float = 10000.0,
+        scorer: str = "key-key",
+        protected_layers: set = None,
+        protect_boundary: int = 0,
+        min_context_for_compression: int = 0,
     ):
         """
         Args:
             head_dim: Attention head dimension (default 128).
-            bits: Quantization bits for E8 VQ (default 2 for aggressive compression).
+            bits: Quantization bits for E8 VQ (default 2). Applied to both K and V
+                unless key_bits/value_bits override.
+            key_bits: Quantization bits for keys. If None, uses bits.
+            value_bits: Quantization bits for values. If None, uses bits.
             eviction_rate: Fraction of prefix tokens to evict (0–1). Default 0.6.
             sliding_window: Recent tokens always kept regardless of importance score.
             obs_window: Number of recent query positions used to compute importance scores.
             rope_base: RoPE frequency base (rope_theta from model config).
+            scorer: Importance scoring method.
+                "key-key" (default) -- SnapKV-style proxy: recent keys as queries
+                    against all prefix keys. Fast, no extra forward pass.
+                "real" -- Accumulated softmax weights from a dedicated prefill
+                    forward pass with output_attentions=True. Requires the model to
+                    be loaded with attn_implementation='eager' (SDPA suppresses
+                    attention weights silently). Needs model + input_ids passed to
+                    compress(). Expected ~0.35pp improvement at 80% eviction.
+            protected_layers: Set of layer indices to skip quantization on (kept at
+                FP16 after eviction). Default None (no protected layers).
+            protect_boundary: Auto-protect first and last N layers. E.g. protect_boundary=2
+                protects layers 0, 1 and the last 2. Default 0 (disabled).
+            min_context_for_compression: Skip compression entirely when seq_len is below
+                this threshold. 0 = always compress (default).
         """
+        if scorer not in ("key-key", "real"):
+            raise ValueError(f"scorer must be 'key-key' or 'real', got {scorer!r}")
         self.head_dim = head_dim
         self.bits = bits
-        self.levels = 2 ** bits
+        self.key_bits = key_bits if key_bits is not None else bits
+        self.value_bits = value_bits if value_bits is not None else bits
+        self.key_levels = 2 ** self.key_bits
+        self.value_levels = 2 ** self.value_bits
+        self.levels = 2 ** bits  # kept for backward compat
         self.eviction_rate = eviction_rate
         self.sliding_window = sliding_window
         self.obs_window = obs_window
         self.rope_base = rope_base
+        self.scorer = scorer
+        self.protected_layers = set(protected_layers) if protected_layers else set()
+        self.protect_boundary = protect_boundary
+        self.min_context_for_compression = min_context_for_compression
         self.H = hadamard_matrix(head_dim)
 
     def _score_importance(self, keys: torch.Tensor) -> torch.Tensor:
@@ -485,6 +518,60 @@ class NexusQuantEvict:
 
         # Sum attention received per token, averaged over heads and query positions
         importance = attn.sum(dim=2).mean(dim=1)  # (b, seq)
+        return importance
+
+    def _score_importance_real(self, model, input_ids: torch.Tensor) -> torch.Tensor:
+        """Score token importance via real attention weights during prefill.
+
+        Runs a dedicated forward pass with output_attentions=True and collects
+        the full softmax attention weight matrices from every layer and head.
+        For each token position j, importance[j] is the total attention it
+        received from all later positions (i > j), summed across layers and heads
+        and then averaged.
+
+        REQUIRES: model loaded with attn_implementation='eager'.
+        PyTorch SDPA (the default) suppresses attention weights silently —
+        output_attentions=True returns None when SDPA is active.
+
+        Args:
+            model: HuggingFace causal LM loaded with attn_implementation='eager'.
+            input_ids: (batch, seq) token ids for the prefix.
+
+        Returns:
+            importance: (batch, seq) float tensor, higher = more important.
+        """
+        device = input_ids.device
+        b, seq = input_ids.shape
+
+        with torch.no_grad():
+            out = model(
+                input_ids,
+                use_cache=False,
+                output_attentions=True,
+            )
+
+        attentions = out.attentions  # tuple of (b, heads, seq, seq) per layer
+        if attentions is None or len(attentions) == 0 or attentions[0] is None:
+            raise RuntimeError(
+                "output_attentions=True returned None. "
+                "Load the model with attn_implementation='eager' to get real attention weights. "
+                "SDPA (the default) suppresses attention weight output regardless of this flag."
+            )
+
+        # Accumulate: for each token j, how much attention it received from
+        # query positions i >= j (causal column sums).
+        # The causal mask already zeroes the strictly-upper triangle, so
+        # summing all query positions gives the correct causal column sum.
+        importance = torch.zeros(b, seq, dtype=torch.float32, device=device)
+        n_layers = len(attentions)
+
+        for layer_attn in attentions:
+            # layer_attn: (b, heads, seq_q, seq_k)
+            layer_attn = layer_attn.float()           # ensure fp32
+            col_sum = layer_attn.sum(dim=2)            # (b, heads, seq_k)
+            importance += col_sum.mean(dim=1)          # (b, seq_k), avg over heads
+
+        importance = importance / n_layers             # avg over layers
         return importance
 
     def _build_keep_mask(self, importance: torch.Tensor, seq: int) -> torch.Tensor:
@@ -524,11 +611,15 @@ class NexusQuantEvict:
 
         return keep_mask
 
-    def compress(self, past_key_values):
+    def compress(self, past_key_values, model=None, input_ids=None):
         """Compress KV cache in-place: evict + RoPE-rm + Hadamard + E8 + write back.
 
         Args:
             past_key_values: HuggingFace DynamicCache (or legacy .layers API).
+            model: Required when self.scorer == "real". HuggingFace causal LM
+                loaded with attn_implementation='eager'.
+            input_ids: Required when self.scorer == "real". (batch, seq) token ids
+                for the prefix that produced past_key_values.
 
         Returns:
             (past_key_values, prefix_attention_mask)
@@ -539,7 +630,7 @@ class NexusQuantEvict:
         device = None
         n_layers = _num_layers(past_key_values)
 
-        # Use layer 0 keys to compute importance (representative of all layers)
+        # Use layer 0 keys to get shape and device
         k0, _ = _get_layer_kv(past_key_values, 0)
         if device is None:
             device = k0.device
@@ -547,15 +638,37 @@ class NexusQuantEvict:
 
         b, h, seq, d = k0.shape
 
-        importance = self._score_importance(k0.float())          # (b, seq)
+        # --- Score importance ---
+        if self.scorer == "real":
+            if model is None or input_ids is None:
+                raise ValueError(
+                    "scorer='real' requires model and input_ids to be passed to compress(). "
+                    "Also ensure the model was loaded with attn_implementation='eager'."
+                )
+            importance = self._score_importance_real(model, input_ids)  # (b, seq)
+        else:
+            importance = self._score_importance(k0.float())              # (b, seq)
+
         keep_mask = self._build_keep_mask(importance, seq)        # (b, seq) bool
 
         # Build attention mask: 1.0 for kept, 0.0 for evicted (additive-mask convention)
         prefix_attention_mask = keep_mask.float()                 # (b, seq)
 
         H = self.H.float()
-        levels = self.levels
         rope_base = self.rope_base
+
+        # Resolve protected layers (boundary shortcut + explicit set)
+        skip_layers = set(self.protected_layers)
+        if self.protect_boundary > 0:
+            for i in range(min(self.protect_boundary, n_layers)):
+                skip_layers.add(i)
+                skip_layers.add(n_layers - 1 - i)
+
+        # Deferred compression: skip entirely when context is too short
+        if self.min_context_for_compression > 0 and seq < self.min_context_for_compression:
+            return past_key_values, torch.ones(b, seq, device=device)
+
+        mask_4d = keep_mask.unsqueeze(1).unsqueeze(-1).float()  # (b, 1, seq, 1)
 
         for l in range(n_layers):
             k, v = _get_layer_kv(past_key_values, l)
@@ -563,28 +676,33 @@ class NexusQuantEvict:
             v = v.float()
 
             # --- Evict: zero positions that are masked out ---
-            # keep_mask: (b, seq) -> (b, 1, seq, 1) for broadcasting
-            mask_4d = keep_mask.unsqueeze(1).unsqueeze(-1).float()  # (b, 1, seq, 1)
             k = k * mask_4d
             v = v * mask_4d
+
+            # Protected layers: keep FP16 after eviction, skip quantization
+            if l in skip_layers:
+                k_out = (k * mask_4d).to(dtype=torch.float16, device=device)
+                v_out = (v * mask_4d).to(dtype=torch.float16, device=device)
+                _set_layer_kv(past_key_values, l, k_out, v_out)
+                continue
 
             # --- Keys: RoPE removal -> Hadamard -> E8 -> inv Hadamard -> re-RoPE ---
             k_out_batches = []
             for bi in range(b):
                 k_bi = k[bi]  # (h, seq, d)
-                k_nr = inverse_rope(k_bi, base=rope_base)                         # (h, seq, d)
-                k_rot = torch.einsum('hsd,de->hse', k_nr, H)                      # (h, seq, d)
-                k_flat = k_rot.reshape(-1, d)                                      # (h*seq, d)
-                k_q = E8Lattice.quantize_perhead(k_flat, levels=levels)            # (h*seq, d)
-                k_back = torch.einsum('hsd,ed->hse', k_q.reshape(h, seq, d), H)   # (h, seq, d)
-                k_roped = forward_rope(k_back, base=rope_base)                     # (h, seq, d)
+                k_nr = inverse_rope(k_bi, base=rope_base)                                   # (h, seq, d)
+                k_rot = torch.einsum('hsd,de->hse', k_nr, H)                               # (h, seq, d)
+                k_flat = k_rot.reshape(-1, d)                                               # (h*seq, d)
+                k_q = E8Lattice.quantize_perhead(k_flat, levels=self.key_levels)            # (h*seq, d)
+                k_back = torch.einsum('hsd,ed->hse', k_q.reshape(h, seq, d), H)            # (h, seq, d)
+                k_roped = forward_rope(k_back, base=rope_base)                              # (h, seq, d)
                 k_out_batches.append(k_roped)
             k_out = torch.stack(k_out_batches, dim=0).to(dtype=torch.float16, device=device)
 
             # --- Values: Hadamard -> E8 -> inv Hadamard ---
-            v_rot = torch.einsum('bhsd,de->bhse', v, H)                            # (b, h, seq, d)
-            v_flat = v_rot.reshape(-1, d)                                           # (b*h*seq, d)
-            v_q = E8Lattice.quantize_perhead(v_flat, levels=levels)                # (b*h*seq, d)
+            v_rot = torch.einsum('bhsd,de->bhse', v, H)                                    # (b, h, seq, d)
+            v_flat = v_rot.reshape(-1, d)                                                   # (b*h*seq, d)
+            v_q = E8Lattice.quantize_perhead(v_flat, levels=self.value_levels)             # (b*h*seq, d)
             v_out = torch.einsum('bhsd,ed->bhse', v_q.reshape(b, h, seq, d), H
                                  ).to(dtype=torch.float16, device=device)
 
@@ -595,6 +713,125 @@ class NexusQuantEvict:
             _set_layer_kv(past_key_values, l, k_out, v_out)
 
         return past_key_values, prefix_attention_mask
+
+
+class NexusQuantEvictTruncate(NexusQuantEvict):
+    """Physical KV tensor truncation with contiguous RoPE remapping.
+
+    Extends NexusQuantEvict by REMOVING evicted tokens from tensors entirely,
+    rather than zeroing them. This delivers real GPU memory savings and faster
+    attention (fewer tokens in KV = fewer FLOPs).
+
+    The critical correctness fix: after removing tokens, the surviving keys
+    carry RoPE encodings for their original (non-contiguous) positions. We
+    strip those encodings and re-apply RoPE at contiguous positions [0,1,...,n-1].
+    Generation then continues from position n (= number of kept tokens).
+
+    Returns:
+        (past_key_values, new_position_ids_start)
+        - past_key_values: cache with physically truncated tensors
+        - new_position_ids_start: int, pass as position_ids start for generation
+
+    Usage:
+        nq = NexusQuantEvictTruncate(eviction_rate=0.6)
+        past_key_values, next_pos = nq.compress(past_key_values)
+        # For generation: position_ids = torch.arange(next_pos, next_pos + max_new_tokens)
+    """
+
+    def compress(self, past_key_values):
+        """Physically truncate KV cache: evict + remap RoPE to contiguous positions.
+
+        Args:
+            past_key_values: HuggingFace DynamicCache (or legacy .layers API).
+
+        Returns:
+            (past_key_values, new_position_ids_start)
+            - past_key_values: modified in-place; evicted tokens physically removed.
+            - new_position_ids_start: int, first position for the next generated token.
+        """
+        device = None
+        n_layers = _num_layers(past_key_values)
+
+        k0, _ = _get_layer_kv(past_key_values, 0)
+        device = k0.device
+        self.H = self.H.to(device)
+
+        b, h, seq, d = k0.shape
+
+        # scorer="real" not supported in truncation path (no model/input_ids arg here)
+        importance = self._score_importance(k0.float())       # (b, seq)
+        keep_mask = self._build_keep_mask(importance, seq)    # (b, seq) bool
+
+        # kept_indices: positions that survive, shape (n_kept,)
+        # Use batch element 0; mask is identical across elements for same-length seqs.
+        kept_indices = keep_mask[0].nonzero(as_tuple=True)[0]  # (n_kept,)
+        n_kept = kept_indices.shape[0]
+
+        # Original positions for RoPE inverse (non-contiguous after eviction)
+        orig_positions = kept_indices.float()                   # (n_kept,)
+        # New contiguous positions [0, 1, ..., n_kept-1]
+        new_positions = torch.arange(n_kept, dtype=torch.float32, device=device)
+
+        H = self.H.float()
+        rope_base = self.rope_base
+
+        # Resolve protected layers (boundary shortcut + explicit set)
+        skip_layers = set(self.protected_layers)
+        if self.protect_boundary > 0:
+            for i in range(min(self.protect_boundary, n_layers)):
+                skip_layers.add(i)
+                skip_layers.add(n_layers - 1 - i)
+
+        # Deferred compression: skip entirely when context is too short
+        if self.min_context_for_compression > 0 and seq < self.min_context_for_compression:
+            return past_key_values, seq
+
+        for l in range(n_layers):
+            k, v = _get_layer_kv(past_key_values, l)
+
+            # Physical truncation: gather only kept token positions
+            # k shape: (b, h, seq, d) -> (b, h, n_kept, d)
+            k_kept = k[:, :, kept_indices, :].float()
+            v_kept = v[:, :, kept_indices, :].float()
+
+            # Protected layers: keep FP16 at truncated positions, skip quantization
+            if l in skip_layers:
+                _set_layer_kv(past_key_values, l,
+                              k_kept.to(dtype=torch.float16, device=device),
+                              v_kept.to(dtype=torch.float16, device=device))
+                continue
+
+            # --- Keys: strip RoPE at original positions, re-apply at contiguous positions ---
+            k_out_batches = []
+            for bi in range(b):
+                k_bi = k_kept[bi]   # (h, n_kept, d)
+                # Remove RoPE encoded at the original non-contiguous positions
+                k_nr = inverse_rope_at_positions(k_bi, orig_positions, base=rope_base)
+                # Hadamard + E8 quantization
+                k_rot = torch.einsum('hsd,de->hse', k_nr, H)
+                k_flat = k_rot.reshape(-1, d)
+                k_q = E8Lattice.quantize_perhead(k_flat, levels=self.key_levels)
+                k_back = torch.einsum('hsd,ed->hse', k_q.reshape(h, n_kept, d), H)
+                # Re-apply RoPE at contiguous positions [0, 1, ..., n_kept-1]
+                k_roped = forward_rope_at_positions(k_back, new_positions, base=rope_base)
+                k_out_batches.append(k_roped)
+            k_out = torch.stack(k_out_batches, dim=0).to(dtype=torch.float16, device=device)
+
+            # --- Values: Hadamard + E8 (no RoPE on values) ---
+            v_rot = torch.einsum('bhsd,de->bhse', v_kept, H)
+            v_flat = v_rot.reshape(-1, d)
+            v_q = E8Lattice.quantize_perhead(v_flat, levels=self.value_levels)
+            v_out = torch.einsum('bhsd,ed->bhse', v_q.reshape(b, h, n_kept, d), H
+                                 ).to(dtype=torch.float16, device=device)
+
+            _set_layer_kv(past_key_values, l, k_out, v_out)
+
+        # Update DynamicCache's seen-token counter to reflect the shorter sequence
+        if hasattr(past_key_values, '_seen_tokens'):
+            past_key_values._seen_tokens = n_kept
+
+        # new_position_ids_start: generation continues from position n_kept
+        return past_key_values, n_kept
 
 
 def compress_kv_cache(past_key_values, mode: str = "simple", head_dim: int = 128, **kwargs) -> Any:

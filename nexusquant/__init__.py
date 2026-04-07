@@ -1,9 +1,12 @@
 """NexusQuant: Training-Free KV Cache Compression via E8 Lattice VQ + Token Eviction.
 
-GPU-validated numbers (Mistral-7B, A100, all overhead included):
-  10.4x at +0.43% PPL (quality="high", 35% eviction)
-  16.8x at +1.34% PPL (quality="balanced", 60% eviction)
-  33.3x at +2.64% PPL (quality="max", 80% eviction)
+GPU-validated numbers (Mistral-7B, WikiText-2, all overhead included):
+  ~9x  at +0.35% PPL  (quality="high",     K3V2, 35% eviction, A100, 3544-tok prefix)
+  ~17x at +0.82% PPL  (quality="balanced", K2V2, 60% eviction, A10G, 1664-tok prefix)
+  ~33x at +2.13% PPL  (quality="max",      K2V2, 80% eviction, A10G, 1664-tok prefix)
+
+PPL delta is context-length dependent. Shorter prefixes (<500 tok) will show higher
+degradation; longer prefixes (1664+ tok) benefit from better scorer discrimination.
 
 Training-free. Zero calibration. One line of code. Apache 2.0.
 
@@ -21,6 +24,7 @@ from nexusquant.pipeline import (
     NexusQuantSimple,
     NexusQuantMax,
     NexusQuantEvict,
+    NexusQuantEvictTruncate,
     compress_kv_cache,
 )
 
