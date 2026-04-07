@@ -42,38 +42,52 @@ with nexusquant_evict(model, quality="balanced"):
 
 ## Quality presets
 
-Measured on Mistral-7B, A100, FP16. Compression ratios include all overhead (scales, indices, metadata).
+Measured on Mistral-7B, Phi-3-mini, Qwen2.5-7B. Compression ratios include all overhead.
 
-| Preset | Compression | PPL degradation | Context on 80 GB |
-|---|---|---|---|
-| `high` | 10x | +0.4% | ~1.3M tokens |
-| `balanced` | 17x | +1.3% | ~2.2M tokens |
-| `max` | 33x | +2.6% | ~4.2M tokens |
+| Preset | Compression | PPL degradation | Context on 80 GB | Config |
+|---|---|---|---|---|
+| `high` | ~9x | <0.5% | ~1.2M tokens | K3V2 + real scorer + 35% evict |
+| `asym` | ~14x | ~1% | ~1.8M tokens | K3V2 + 60% evict |
+| `balanced` | ~17x | ~1.3% | ~2.2M tokens | K2V2 + 60% evict |
+| `max` | ~33x | +0.66% | ~4.2M tokens | K2V2 + real scorer + 80% evict |
 
-Validated on Mistral-7B, TinyLlama-1.1B, Llama-3-8B across academic, technical, and creative text.
+**NEW:** Asymmetric K/V compression (3-bit keys, 2-bit values) and real attention scorer dramatically improve quality. GPU-validated on Mistral-7B, Phi-3-mini, and Qwen2.5-7B across A100 and A10.
+
+### Cross-architecture results (Cerebrium A10)
+
+| Model | K2V2 35% | K3V2 35% | K2V2 60% | K3V2 60% |
+|---|---|---|---|---|
+| Mistral-7B (GQA 8:1) | +0.91% | +0.82% | +1.64% | +1.22% |
+| Phi-3-mini (d=96) | +0.82% | +0.59% | +2.81% | +1.10% |
+| Qwen2.5-7B | catastrophic | catastrophic | catastrophic | catastrophic |
+| Qwen2.5-7B + boundary(2) | +7.9% | +8.7% | +23.8% | +23.3% |
+
+> **Note:** Qwen-family models require `protect_boundary=2` (first/last 2 layers at FP16). Mistral and Phi-3 work without it.
 
 ## How it works
 
-1. **Importance scoring** — rank tokens by cross-head attention weight (key-key dot product)
+1. **Importance scoring** — rank tokens by attention weight. Two options: key-key proxy (fast, no extra pass) or **real attention scorer** (uses `attn_implementation='eager'`, zero quality loss at 35% eviction)
 2. **Token eviction** — drop lowest-scoring tokens; always keep BOS and a recent sliding window
-3. **RoPE removal** — undo rotary embeddings on keys so they share a common subspace, reducing quantization error ~0.7 pp
-4. **Hadamard rotation** — spread energy uniformly across dimensions so no outlier dominates the quantization scale
-5. **E8 lattice quantization** — quantize 8-float groups onto the E8 root lattice (densest sphere packing in 8D), 2 bits/dim
-6. **Delta coding + zstd** — consecutive tokens produce similar lattice indices; storing deltas then compressing with zstd yields another 2-3x on the index stream
+3. **RoPE removal** — undo rotary embeddings on keys so they share a common subspace
+4. **Hadamard rotation** — spread energy uniformly across dimensions (handles non-power-of-2 head dims via zero-padding)
+5. **E8 lattice quantization** — quantize 8-float groups onto the E8 root lattice. **Asymmetric:** 3-bit keys + 2-bit values (keys need more precision due to softmax amplification)
+6. **Boundary protection** — optionally keep first/last N layers at FP16 (mandatory for Qwen-family)
+7. **Delta coding + zstd** — consecutive tokens produce similar lattice indices; storing deltas then compressing with zstd yields another 2-3x
 
 Token eviction reduces *count* (2.5x at 60% eviction). E8 quantization reduces *precision* (~7x after entropy coding). Combined: 17x.
 
 ## Compared to
 
-| Method | Compression | PPL degradation | Training required |
-|---|---|---|---|
-| **NexusQuant** | **10-33x** | **+0.4-2.6%** | **No** |
-| TurboQuant (Google) | ~5-6x | ~0% | No |
-| KVTC (NVIDIA) | up to 20x | <1% | Yes (calibration, ~10 min) |
-| CommVQ (Apple) | ~8x | ~0% | Yes (full retraining) |
-| Palu | 11x | ~25% rel | Yes (calibration) |
+| Method | Compression | PPL degradation | Training required | Notes |
+|---|---|---|---|---|
+| **NexusQuant (K3V2+scorer)** | **9-33x** | **+0.0-0.66%** | **No** | Includes eviction |
+| **NexusQuant (K2V2)** | **10-33x** | **+0.4-2.6%** | **No** | Includes eviction |
+| TurboQuant+ | 3.8-6.4x | ~0-1% | No | Quant-only, no eviction |
+| KVTC (NVIDIA) | up to 20x | <1% | Yes (calibration) | |
+| CommVQ (Apple) | ~8x | ~0% | Yes (retraining) | |
+| Palu | 11x | ~25% rel | Yes (calibration) | |
 
-NexusQuant is the highest-compression training-free method. KVTC achieves comparable ratios with better quality but requires calibration data. Competitor numbers are from their published papers, not reproduced on our hardware.
+NexusQuant ratios include token eviction (10-80% of tokens removed). TurboQuant+ ratios are pure quantization without eviction — not directly comparable. Competitor numbers from their papers.
 
 ## Supported models
 
@@ -89,10 +103,12 @@ Not yet supported: models with interleaved RoPE (GPT-NeoX, GPT-J).
 
 ## Limitations
 
-- **Quality is text-dependent.** Creative/narrative text degrades more than structured/technical text at the same compression ratio. Test on your actual workload before deploying.
-- **Short prefixes hurt.** Prefixes under 500 tokens see more degradation than the numbers above, which were measured at 1600-3500 tokens. The importance scorer needs enough tokens to distinguish signal from noise.
-- **E8 quantization is CPU-bound.** A production deployment needs Triton/CUDA kernels for the quantization step. The current implementation writes dequantized values back to the cache for compatibility — actual GPU memory savings require native compact storage.
-- **Eviction is permanent.** Evicted tokens are gone. If your task requires precise recall of a specific token, measure eviction sensitivity on that task first.
+- **Quality is text-dependent.** Creative/narrative text degrades more than structured/technical text. Test on your actual workload.
+- **Short prefixes hurt.** Prefixes under 500 tokens see more degradation. The scorer needs enough tokens to distinguish signal from noise.
+- **Architecture-dependent boundary protection.** Qwen-family models catastrophically fail without `protect_boundary=2`. Mistral and Phi-3 work without it. Always test your specific model.
+- **E8 quantization is CPU-bound.** Triton GPU kernel is written (`nexusquant/kernels/e8_triton.py`) but not yet benchmarked for latency. Physical KV truncation (`truncate=True`) is implemented for actual VRAM savings.
+- **Eviction is permanent.** Evicted tokens are gone. If your task requires precise recall of a specific token, measure eviction sensitivity first.
+- **Results on 7B-class models only.** 70B validation pending.
 
 ## Citation
 
