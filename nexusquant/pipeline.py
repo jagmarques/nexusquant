@@ -8,10 +8,11 @@ The Simple pipeline is our recommended default — 3 stages, zero calibration,
 matches TurboQuant quality. Use Max only when you need >5.3x compression.
 """
 
+import math
 import torch
 import torch.nn.functional as F
 import numpy as np
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Union
 
 from nexusquant.core.e8_lattice import E8Lattice
 from nexusquant.core.hadamard import hadamard_matrix
@@ -438,14 +439,16 @@ class NexusQuantEvict:
         bits: int = 2,
         key_bits: int = None,
         value_bits: int = None,
-        eviction_rate: float = 0.6,
+        eviction_rate: Union[float, str] = 0.6,
         sliding_window: int = 32,
         obs_window: int = 32,
         rope_base: float = 10000.0,
         scorer: str = "key-key",
         protected_layers: set = None,
-        protect_boundary: int = 0,
+        protect_boundary: Union[int, str] = 0,
         min_context_for_compression: int = 0,
+        soft_eviction: bool = False,
+        adaptive_context: bool = False,
     ):
         """
         Args:
@@ -455,6 +458,9 @@ class NexusQuantEvict:
             key_bits: Quantization bits for keys. If None, uses bits.
             value_bits: Quantization bits for values. If None, uses bits.
             eviction_rate: Fraction of prefix tokens to evict (0–1). Default 0.6.
+                Pass "auto" to measure attention entropy and choose the rate
+                adaptively: high-entropy (creative/uniform) text → lower eviction;
+                low-entropy (peaked/structured) text → higher eviction.
             sliding_window: Recent tokens always kept regardless of importance score.
             obs_window: Number of recent query positions used to compute importance scores.
             rope_base: RoPE frequency base (rope_theta from model config).
@@ -470,11 +476,34 @@ class NexusQuantEvict:
                 FP16 after eviction). Default None (no protected layers).
             protect_boundary: Auto-protect first and last N layers. E.g. protect_boundary=2
                 protects layers 0, 1 and the last 2. Default 0 (disabled).
+                Pass "auto" to probe layer key magnitudes: if first/last layers are
+                >2x brighter than the middle layer, 2-layer boundary protection is
+                enabled automatically (result is cached after the first call).
             min_context_for_compression: Skip compression entirely when seq_len is below
                 this threshold. 0 = always compress (default).
+            soft_eviction: When True, low-importance tokens are quantized at 1-bit
+                (levels=2, sign-only after Hadamard) instead of being zeroed. This
+                preserves directional information in evicted tokens at the cost of
+                slightly higher memory vs. hard eviction. The returned attention mask
+                is all-ones (no tokens are removed; all positions remain visible).
+                Default False (hard eviction, current behaviour).
+            adaptive_context: When True, scale eviction rate down for short prefixes.
+                Default False.
+                  seq < 256  → evict_rate = 0.0
+                  seq < 512  → evict_rate *= 0.5
+                  seq < 1024 → evict_rate *= 0.75
+                  seq >= 1024 → full evict_rate
         """
         if scorer not in ("key-key", "real"):
             raise ValueError(f"scorer must be 'key-key' or 'real', got {scorer!r}")
+        if not (isinstance(eviction_rate, (int, float)) or eviction_rate == "auto"):
+            raise ValueError(
+                f"eviction_rate must be a float in [0, 1] or 'auto', got {eviction_rate!r}"
+            )
+        if not (isinstance(protect_boundary, int) or protect_boundary == "auto"):
+            raise ValueError(
+                f"protect_boundary must be a non-negative int or 'auto', got {protect_boundary!r}"
+            )
         self.head_dim = head_dim
         self.bits = bits
         self.key_bits = key_bits if key_bits is not None else bits
@@ -482,14 +511,16 @@ class NexusQuantEvict:
         self.key_levels = 2 ** self.key_bits
         self.value_levels = 2 ** self.value_bits
         self.levels = 2 ** bits  # kept for backward compat
-        self.eviction_rate = eviction_rate
+        self.eviction_rate = eviction_rate  # float or "auto"
         self.sliding_window = sliding_window
         self.obs_window = obs_window
         self.rope_base = rope_base
         self.scorer = scorer
         self.protected_layers = set(protected_layers) if protected_layers else set()
-        self.protect_boundary = protect_boundary
+        self.protect_boundary = protect_boundary  # int or "auto"
         self.min_context_for_compression = min_context_for_compression
+        self.soft_eviction = soft_eviction
+        self.adaptive_context = adaptive_context
         self.H = hadamard_matrix(head_dim)
 
     def _score_importance(self, keys: torch.Tensor) -> torch.Tensor:
@@ -574,22 +605,84 @@ class NexusQuantEvict:
         importance = importance / n_layers             # avg over layers
         return importance
 
-    def _build_keep_mask(self, importance: torch.Tensor, seq: int) -> torch.Tensor:
+    def _compute_adaptive_eviction_rate(self, importance: torch.Tensor, seq: int) -> float:
+        """Compute eviction rate based on attention entropy.
+
+        High entropy (uniform attention, creative text) → lower eviction (more conservative).
+        Low entropy (peaked attention, structured text) → higher eviction (safe to remove more).
+
+        Args:
+            importance: (batch, seq) importance scores from _score_importance
+            seq: total sequence length
+
+        Returns:
+            evict_rate: float in [0.1, 0.7]
+        """
+        # Normalize importance to a probability distribution
+        probs = importance[0] / (importance[0].sum() + 1e-8)
+        entropy = -(probs * (probs + 1e-8).log()).sum().item()
+        max_entropy = math.log(seq)  # uniform distribution entropy
+        normalized_entropy = entropy / max_entropy  # 0 = peaked, 1 = uniform
+
+        # Map entropy to eviction rate:
+        # Low entropy (0.3) → high eviction (0.55)
+        # High entropy (0.9) → low eviction (0.25)
+        rate = 0.7 - 0.5 * normalized_entropy  # linear mapping
+        return max(0.1, min(0.7, rate))  # clamp to [0.1, 0.7]
+
+    def _auto_detect_boundary(self, past_key_values) -> int:
+        """Auto-detect if boundary protection is needed.
+
+        Compares key magnitudes of the first and last layers against the middle
+        layer.  If first/last are >2x brighter than the middle layer the model
+        has strong boundary activations and 2-layer protection is enabled.
+
+        The result is cached on self after the first call so subsequent
+        compress() calls pay no probing cost.
+
+        Returns:
+            n_protect: 0 (no protection) or 2 (protect first+last 2 layers)
+        """
+        if hasattr(self, '_auto_boundary_cached'):
+            return self._auto_boundary_cached
+
+        n_layers = _num_layers(past_key_values)
+        if n_layers < 6:
+            self._auto_boundary_cached = 0
+            return 0
+
+        k_first, _ = _get_layer_kv(past_key_values, 0)
+        k_last, _ = _get_layer_kv(past_key_values, n_layers - 1)
+        k_mid, _ = _get_layer_kv(past_key_values, n_layers // 2)
+
+        mag_boundary = (k_first.float().abs().mean() + k_last.float().abs().mean()) / 2
+        mag_middle = k_mid.float().abs().mean()
+
+        ratio = (mag_boundary / (mag_middle + 1e-8)).item()
+        self._auto_boundary_cached = 2 if ratio > 2.0 else 0
+        return self._auto_boundary_cached
+
+    def _build_keep_mask(self, importance: torch.Tensor, seq: int,
+                         eviction_rate: float = None) -> torch.Tensor:
         """Build boolean keep mask: BOS + top-k important + sliding window.
 
         Args:
             importance: (batch, seq) importance scores
             seq: total sequence length
+            eviction_rate: fraction to evict; falls back to self.eviction_rate when
+                None (used internally when the rate has already been resolved).
 
         Returns:
             keep_mask: (batch, seq) bool, True = keep token
         """
+        if eviction_rate is None:
+            eviction_rate = self.eviction_rate  # backward-compat default
         b = importance.shape[0]
         device = importance.device
 
         # How many tokens to keep from the evictable prefix
         prefix_len = max(seq - self.sliding_window, 0)
-        n_keep = max(1, int(prefix_len * (1.0 - self.eviction_rate)))
+        n_keep = max(1, int(prefix_len * (1.0 - eviction_rate)))
 
         keep_mask = torch.zeros(b, seq, dtype=torch.bool, device=device)
 
@@ -649,7 +742,23 @@ class NexusQuantEvict:
         else:
             importance = self._score_importance(k0.float())              # (b, seq)
 
-        keep_mask = self._build_keep_mask(importance, seq)        # (b, seq) bool
+        # --- Feature 1: Resolve eviction rate (fixed float or "auto") ---
+        if self.eviction_rate == "auto":
+            evict_rate = self._compute_adaptive_eviction_rate(importance, seq)
+        else:
+            evict_rate = float(self.eviction_rate)
+
+        # --- Feature 2: Graduated context-aware scaling ---
+        if self.adaptive_context:
+            if seq < 256:
+                evict_rate = 0.0
+            elif seq < 512:
+                evict_rate *= 0.5
+            elif seq < 1024:
+                evict_rate *= 0.75
+            # else: full evict_rate
+
+        keep_mask = self._build_keep_mask(importance, seq, eviction_rate=evict_rate)  # (b, seq) bool
 
         # Build attention mask: 1.0 for kept, 0.0 for evicted (additive-mask convention)
         prefix_attention_mask = keep_mask.float()                 # (b, seq)
@@ -657,10 +766,16 @@ class NexusQuantEvict:
         H = self.H.float()
         rope_base = self.rope_base
 
+        # --- Feature 3: Resolve boundary protection (fixed int or "auto") ---
+        if self.protect_boundary == "auto":
+            n_protect = self._auto_detect_boundary(past_key_values)
+        else:
+            n_protect = int(self.protect_boundary)
+
         # Resolve protected layers (boundary shortcut + explicit set)
         skip_layers = set(self.protected_layers)
-        if self.protect_boundary > 0:
-            for i in range(min(self.protect_boundary, n_layers)):
+        if n_protect > 0:
+            for i in range(min(n_protect, n_layers)):
                 skip_layers.add(i)
                 skip_layers.add(n_layers - 1 - i)
 
@@ -670,6 +785,55 @@ class NexusQuantEvict:
 
         mask_4d = keep_mask.unsqueeze(1).unsqueeze(-1).float()  # (b, 1, seq, 1)
 
+        if self.soft_eviction:
+            # Soft eviction: kept tokens at full precision (key_levels/value_levels),
+            # evicted tokens at 1-bit (levels=2, sign-only after Hadamard rotation).
+            # No tokens removed — all positions remain visible; mask is all-ones.
+            ones_mask = torch.ones(b, seq, dtype=torch.float32, device=device)
+
+            for l in range(n_layers):
+                k, v = _get_layer_kv(past_key_values, l)
+                k = k.float()
+                v = v.float()
+
+                # Protected layers: keep at FP16, no quantization
+                if l in skip_layers:
+                    _set_layer_kv(past_key_values, l, k.half(), v.half())
+                    continue
+
+                # --- Keys: RoPE removal -> Hadamard -> dual-precision E8 -> inv Hadamard -> re-RoPE ---
+                k_out_batches = []
+                for bi in range(b):
+                    k_bi = k[bi]                                                                  # (h, seq, d)
+                    k_nr = inverse_rope(k_bi, base=rope_base)                                     # (h, seq, d)
+                    k_rot = torch.einsum('hsd,de->hse', k_nr, H)                                 # (h, seq, d)
+                    k_flat = k_rot.reshape(-1, d)                                                 # (h*seq, d)
+                    # Full precision for important tokens; 1-bit for soft-evicted tokens
+                    k_q_full = E8Lattice.quantize_perhead(k_flat, levels=self.key_levels)        # (h*seq, d)
+                    k_q_1bit = E8Lattice.quantize_perhead(k_flat, levels=2)                      # (h*seq, d)
+                    # keep_flat: 1.0 where important, 0.0 where soft-evicted
+                    keep_flat = mask_4d[bi].expand(h, seq, 1).reshape(h * seq, 1)               # (h*seq, 1)
+                    k_q = k_q_full * keep_flat + k_q_1bit * (1.0 - keep_flat)                   # (h*seq, d)
+                    k_back = torch.einsum('hsd,ed->hse', k_q.reshape(h, seq, d), H)             # (h, seq, d)
+                    k_roped = forward_rope(k_back, base=rope_base)                               # (h, seq, d)
+                    k_out_batches.append(k_roped)
+                k_out = torch.stack(k_out_batches, dim=0).to(dtype=torch.float16, device=device)
+
+                # --- Values: Hadamard -> dual-precision E8 -> inv Hadamard ---
+                v_rot = torch.einsum('bhsd,de->bhse', v, H)                                      # (b, h, seq, d)
+                v_flat = v_rot.reshape(-1, d)                                                     # (b*h*seq, d)
+                v_q_full = E8Lattice.quantize_perhead(v_flat, levels=self.value_levels)          # (b*h*seq, d)
+                v_q_1bit = E8Lattice.quantize_perhead(v_flat, levels=2)                          # (b*h*seq, d)
+                keep_v_flat = mask_4d.expand(b, h, seq, 1).reshape(b * h * seq, 1)              # (b*h*seq, 1)
+                v_q = v_q_full * keep_v_flat + v_q_1bit * (1.0 - keep_v_flat)                   # (b*h*seq, d)
+                v_out = torch.einsum('bhsd,ed->bhse', v_q.reshape(b, h, seq, d), H
+                                     ).to(dtype=torch.float16, device=device)
+
+                _set_layer_kv(past_key_values, l, k_out, v_out)
+
+            return past_key_values, ones_mask
+
+        # --- Hard eviction (default behaviour, soft_eviction=False) ---
         for l in range(n_layers):
             k, v = _get_layer_kv(past_key_values, l)
             k = k.float()
@@ -760,7 +924,24 @@ class NexusQuantEvictTruncate(NexusQuantEvict):
 
         # scorer="real" not supported in truncation path (no model/input_ids arg here)
         importance = self._score_importance(k0.float())       # (b, seq)
-        keep_mask = self._build_keep_mask(importance, seq)    # (b, seq) bool
+
+        # --- Feature 1: Resolve eviction rate (fixed float or "auto") ---
+        if self.eviction_rate == "auto":
+            evict_rate = self._compute_adaptive_eviction_rate(importance, seq)
+        else:
+            evict_rate = float(self.eviction_rate)
+
+        # --- Feature 2: Graduated context-aware scaling ---
+        if self.adaptive_context:
+            if seq < 256:
+                evict_rate = 0.0
+            elif seq < 512:
+                evict_rate *= 0.5
+            elif seq < 1024:
+                evict_rate *= 0.75
+            # else: full evict_rate
+
+        keep_mask = self._build_keep_mask(importance, seq, eviction_rate=evict_rate)  # (b, seq) bool
 
         # kept_indices: positions that survive, shape (n_kept,)
         # Use batch element 0; mask is identical across elements for same-length seqs.
@@ -775,10 +956,16 @@ class NexusQuantEvictTruncate(NexusQuantEvict):
         H = self.H.float()
         rope_base = self.rope_base
 
+        # --- Feature 3: Resolve boundary protection (fixed int or "auto") ---
+        if self.protect_boundary == "auto":
+            n_protect = self._auto_detect_boundary(past_key_values)
+        else:
+            n_protect = int(self.protect_boundary)
+
         # Resolve protected layers (boundary shortcut + explicit set)
         skip_layers = set(self.protected_layers)
-        if self.protect_boundary > 0:
-            for i in range(min(self.protect_boundary, n_layers)):
+        if n_protect > 0:
+            for i in range(min(n_protect, n_layers)):
                 skip_layers.add(i)
                 skip_layers.add(n_layers - 1 - i)
 

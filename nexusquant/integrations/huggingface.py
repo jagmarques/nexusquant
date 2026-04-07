@@ -495,7 +495,7 @@ _EVICT_PRESETS = {
 @contextmanager
 def nexusquant_evict(
     model,
-    eviction_rate: float = 0.6,
+    eviction_rate=0.6,
     quality: str = "balanced",
     sliding_window: int = 32,
     obs_window: int = 32,
@@ -506,8 +506,9 @@ def nexusquant_evict(
     scorer: str = "key-key",
     input_ids=None,
     protected_layers: set = None,
-    protect_boundary: int = 0,
+    protect_boundary=0,
     min_context_for_compression: int = 0,
+    adaptive_context: bool = False,
     verbose: bool = True,
 ):
     """Compress KV cache with attention-aware token eviction + E8 quantization.
@@ -536,6 +537,7 @@ def nexusquant_evict(
         model: Any HuggingFace causal LM using DynamicCache.
         eviction_rate: Fraction of prefix tokens to evict (ignored when quality preset
             is one of the named presets; set quality=None to use this directly).
+            Pass "auto" to compute per-call from attention entropy.
         quality: Preset name ("high", "balanced", "max") or None to use raw args.
         sliding_window: Recent tokens always kept (never evicted).
         obs_window: Number of recent positions used to score importance (key-key only).
@@ -553,6 +555,10 @@ def nexusquant_evict(
             Expected benefit over key-key: ~0.35pp at 80% eviction.
         input_ids: Required when scorer="real". The (batch, seq) prefix token ids
             used to run the importance-scoring forward pass before prefill hooks fire.
+        protect_boundary: Auto-protect first/last N layers (int) or "auto" to probe
+            key magnitudes and decide automatically. Default 0.
+        adaptive_context: Scale eviction rate down for short prefixes (seq < 1024).
+            Default False.
         verbose: Print stats on exit.
 
     Yields:
@@ -621,6 +627,7 @@ def nexusquant_evict(
         protected_layers=protected_layers,
         protect_boundary=protect_boundary,
         min_context_for_compression=min_context_for_compression,
+        adaptive_context=adaptive_context,
     )
     compressor.last_mask = None       # set on first prefill (masking path)
     compressor.next_position = None   # set on first prefill (truncation path)
@@ -705,11 +712,15 @@ def nexusquant_evict(
         bits_label = f"K={_kb}-bit/V={_vb}-bit E8" if _kb != _vb else f"{_kb}-bit E8"
         boundary_label = f", protect_boundary={protect_boundary}" if protect_boundary else ""
         ctx_label = f", min_ctx={min_context_for_compression}" if min_context_for_compression else ""
+        adaptive_label = ", adaptive_context=True" if adaptive_context else ""
+        eviction_display = (
+            "auto" if eviction_rate == "auto" else f"{eviction_rate:.0%}"
+        )
         print(
             f"NexusQuantEvict: activating on {model_name} "
-            f"(eviction={eviction_rate:.0%}, {bits_label}, "
+            f"(eviction={eviction_display}, {bits_label}, "
             f"sliding_window={sliding_window}, mode={mode_label}, scorer={scorer}"
-            f"{boundary_label}{ctx_label})",
+            f"{boundary_label}{ctx_label}{adaptive_label})",
             flush=True,
         )
 
