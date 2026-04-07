@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nexusquant-kv"
+version = "0.4.0"
+description = "Training-free KV cache compression via E8 lattice quantization and attention-aware token eviction"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.9"
+authors = [{name = "Joao Marques"}]
+keywords = [
+    "kv-cache", "compression", "quantization", "llm", "inference",
+    "e8-lattice", "token-eviction", "transformers", "long-context",
+    "memory-efficient", "attention", "vector-quantization",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "torch>=2.0",
+    "numpy>=1.24",
+    "zstandard>=0.22",
+]
+
+[project.optional-dependencies]
+hf = ["transformers>=4.40"]
+all = ["transformers>=4.40", "accelerate>=0.26"]
+
+[project.urls]
+Repository = "https://github.com/jagmarques/nexusquant"
+
+[tool.setuptools.packages.find]
+include = ["nexusquant*"]
