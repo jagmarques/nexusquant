@@ -137,16 +137,25 @@ class NexusQuantSimple:
             b, h, seq, d = k.shape
 
             # Keys: remove RoPE -> Hadamard -> E8 -> inverse Hadamard -> re-RoPE
-            k_nr = inverse_rope(k[0], base=self.rope_base)  # (h, seq, d)
-            if self.merge_pct > 0:
-                k_nr, v_merged = merge_and_drop(k_nr, v[0], self.merge_pct)
-                v = v_merged.unsqueeze(0)
-            k_rot = torch.einsum('hsd,de->hse', k_nr.float(), self.H.float())
-            # Per-head scaling: 5.12x at 3-bit (vs 3.2x with per-group)
-            k_flat = k_rot.reshape(-1, k_rot.shape[-1])
-            k_q = E8Lattice.quantize_perhead(k_flat, levels=self.levels)
-            k_back = torch.einsum('hsd,ed->hse', k_q.reshape(k_rot.shape), self.H.float())
-            k_out = forward_rope(k_back, base=self.rope_base).unsqueeze(0).half().to(device)
+            # Loop over batch elements to support batch_size > 1
+            k_out_list = []
+            v_list = [v[bi] for bi in range(b)]  # split values per batch for merge_pct
+            for bi in range(b):
+                k_nr = inverse_rope(k[bi], base=self.rope_base)  # (h, seq, d)
+                if self.merge_pct > 0:
+                    k_nr, v_merged = merge_and_drop(k_nr, v_list[bi], self.merge_pct)
+                    v_list[bi] = v_merged
+                k_rot = torch.einsum('hsd,de->hse', k_nr.float(), self.H.float())
+                # Per-head scaling: 5.12x at 3-bit (vs 3.2x with per-group)
+                k_flat = k_rot.reshape(-1, k_rot.shape[-1])
+                k_q = E8Lattice.quantize_perhead(k_flat, levels=self.levels)
+                k_back = torch.einsum('hsd,ed->hse', k_q.reshape(k_rot.shape), self.H.float())
+                k_roped = forward_rope(k_back, base=self.rope_base)  # (h, seq, d)
+                k_out_list.append(k_roped)
+            k_out = torch.stack(k_out_list, dim=0).half().to(device)
+
+            # Rebuild value tensor after possible merge_pct modification
+            v = torch.stack(v_list, dim=0)  # (b, h, seq', d)
 
             # Values: Hadamard -> E8 (per-head scaling)
             v_flat = torch.einsum('bhsd,de->bhse', v.float(), self.H.float()).reshape(-1, v.shape[-1])
@@ -449,6 +458,7 @@ class NexusQuantEvict:
         min_context_for_compression: int = 0,
         soft_eviction: bool = False,
         adaptive_context: bool = False,
+        protected_positions: Optional[torch.Tensor] = None,
     ):
         """
         Args:
@@ -493,6 +503,9 @@ class NexusQuantEvict:
                   seq < 512  → evict_rate *= 0.5
                   seq < 1024 → evict_rate *= 0.75
                   seq >= 1024 → full evict_rate
+            protected_positions: Optional 1-D tensor of token position indices that
+                must never be evicted (e.g. image token spans in VLMs). Default None.
+                Example: torch.tensor([1, 2, 3, 256, 257]) to protect 5 positions.
         """
         if scorer not in ("key-key", "real"):
             raise ValueError(f"scorer must be 'key-key' or 'real', got {scorer!r}")
@@ -521,6 +534,7 @@ class NexusQuantEvict:
         self.min_context_for_compression = min_context_for_compression
         self.soft_eviction = soft_eviction
         self.adaptive_context = adaptive_context
+        self.protected_positions = protected_positions  # Optional[torch.Tensor] of position indices
         self.H = hadamard_matrix(head_dim)
 
     def _score_importance(self, keys: torch.Tensor) -> torch.Tensor:
@@ -706,6 +720,13 @@ class NexusQuantEvict:
                 _, topk_idx = torch.topk(prefix_scores, k=topk_k, dim=1)
                 topk_idx = topk_idx + 1  # offset back (we sliced from 1)
                 keep_mask.scatter_(1, topk_idx, True)
+
+        # Force-keep VLM protected positions (e.g. image token spans)
+        if self.protected_positions is not None:
+            for pos in self.protected_positions:
+                idx = int(pos)
+                if 0 <= idx < seq:
+                    keep_mask[:, idx] = True
 
         return keep_mask
 
@@ -927,6 +948,15 @@ class NexusQuantEvictTruncate(NexusQuantEvict):
         self.H = self.H.to(device)
 
         b, h, seq, d = k0.shape
+
+        # Physical truncation requires identical sequence lengths across batch elements.
+        # Different batch elements would need different kept_indices, producing ragged tensors.
+        if b > 1:
+            raise ValueError(
+                f"NexusQuantEvictTruncate does not support batch_size > 1 (got {b}). "
+                "Physical truncation requires identical sequence lengths across batch elements. "
+                "Use NexusQuantEvict (masking, not truncation) for batched inference."
+            )
 
         # scorer="real" not supported in truncation path (no model/input_ids arg here)
         importance = self._score_importance(k0.float())       # (b, seq)

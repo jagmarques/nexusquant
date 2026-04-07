@@ -122,11 +122,14 @@ def _detect_model_config(model):
     if num_kv_heads is None:
         num_kv_heads = getattr(text_config, "num_attention_heads", 32)
 
+    rope_scaling = getattr(text_config, "rope_scaling", None)
+
     return {
         "head_dim": head_dim,
         "num_layers": num_layers,
         "rope_base": rope_base,
         "num_kv_heads": num_kv_heads,
+        "rope_scaling": rope_scaling,
     }
 
 
@@ -224,6 +227,26 @@ def _install_hooks(model, compressor, stats, min_seq_for_compression, mode):
         raise ImportError(
             "transformers >= 4.44 required for DynamicCache support. "
             "Install with: pip install 'transformers>=4.44'"
+        )
+
+    # Detect offloaded cache support and warn if the model uses it.
+    # OffloadedStaticCache has a different update interface and cannot be
+    # transparently patched the same way as DynamicCache layers.
+    try:
+        from transformers.cache_utils import OffloadedStaticCache as _OffloadedStaticCache
+        _has_offloaded = True
+    except ImportError:
+        _OffloadedStaticCache = None
+        _has_offloaded = False
+
+    if _has_offloaded and hasattr(model, "_offload_cache"):
+        warnings.warn(
+            "NexusQuant detected KV cache offloading (_offload_cache). "
+            "Compression hooks intercept DynamicCache layer updates and may not "
+            "fire for offloaded cache writes. Results may be incorrect or "
+            "compression may silently not apply. Disable KV cache offloading "
+            "when using NexusQuant.",
+            stacklevel=3,
         )
 
     # Save originals for clean restoration
@@ -510,6 +533,7 @@ def nexusquant_evict(
     min_context_for_compression: int = 0,
     soft_eviction: bool = False,
     adaptive_context: bool = False,
+    protected_positions: Optional[torch.Tensor] = None,
     verbose: bool = True,
 ):
     """Compress KV cache with attention-aware token eviction + E8 quantization.
@@ -616,6 +640,25 @@ def nexusquant_evict(
     model_cfg = _detect_model_config(model)
     head_dim = model_cfg["head_dim"]
     rope_base = model_cfg["rope_base"]
+    rope_scaling = model_cfg["rope_scaling"]  # None for most models; dict for Llama-3.1 etc.
+
+    # Warn if the model uses KV cache offloading — our hooks target DynamicCache
+    # and may silently miss offloaded cache updates.
+    try:
+        from transformers.cache_utils import OffloadedStaticCache as _OffloadedStaticCache
+        _has_offloaded = True
+    except ImportError:
+        _has_offloaded = False
+
+    if _has_offloaded and hasattr(model, "_offload_cache"):
+        warnings.warn(
+            "NexusQuantEvict detected KV cache offloading (_offload_cache). "
+            "Compression hooks intercept DynamicCache layer updates and may not "
+            "fire for offloaded cache writes. Results may be incorrect or "
+            "compression may silently not apply. Disable KV cache offloading "
+            "when using NexusQuant.",
+            stacklevel=3,
+        )
 
     compressor_cls = NexusQuantEvictTruncate if truncate else NexusQuantEvict
     compressor = compressor_cls(
@@ -627,12 +670,14 @@ def nexusquant_evict(
         sliding_window=sliding_window,
         obs_window=obs_window,
         rope_base=rope_base,
+        rope_scaling=rope_scaling,
         scorer=scorer,
         protected_layers=protected_layers,
         protect_boundary=protect_boundary,
         min_context_for_compression=min_context_for_compression,
         soft_eviction=soft_eviction,
         adaptive_context=adaptive_context,
+        protected_positions=protected_positions,
     )
     compressor.last_mask = None       # set on first prefill (masking path)
     compressor.next_position = None   # set on first prefill (truncation path)
@@ -663,8 +708,21 @@ def nexusquant_evict(
         def hooked_update(self, key_states, value_states, cache_kwargs=None):
             keys, values = original_method(self, key_states, value_states, cache_kwargs)
 
-            # Only compress on prefill (incoming batch > 1 token)
-            if key_states.shape[-2] < 2:
+            # Fix 2: skip if this cache layer was already compressed (multi-turn safety)
+            if getattr(keys, '_nq_compressed', False):
+                return keys, values
+
+            incoming_seq = key_states.shape[-2]
+            existing_seq = keys.shape[-2] - incoming_seq  # tokens in cache before this update
+
+            # Fix 2+4: skip single-token decode steps
+            if incoming_seq < 2:
+                return keys, values
+
+            # Fix 4: guard against speculative decoding draft-verification passes.
+            # If there is already a large cache and the incoming chunk is tiny
+            # relative to it, this is likely draft verification, not a real prefill.
+            if existing_seq > 0 and incoming_seq < max(existing_seq * 0.1, 8):
                 return keys, values
 
             # Wrap single-layer tensors into a minimal cache-like object for compress()
@@ -697,6 +755,9 @@ def nexusquant_evict(
 
             new_k = single.key_cache[0]
             new_v = single.value_cache[0]
+
+            # Fix 2: mark compressed so subsequent turns skip re-compression
+            new_k._nq_compressed = True
 
             self.keys = new_k
             self.values = new_v
