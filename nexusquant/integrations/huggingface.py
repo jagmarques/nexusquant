@@ -508,6 +508,7 @@ def nexusquant_evict(
     protected_layers: set = None,
     protect_boundary=0,
     min_context_for_compression: int = 0,
+    soft_eviction: bool = False,
     adaptive_context: bool = False,
     verbose: bool = True,
 ):
@@ -557,6 +558,9 @@ def nexusquant_evict(
             used to run the importance-scoring forward pass before prefill hooks fire.
         protect_boundary: Auto-protect first/last N layers (int) or "auto" to probe
             key magnitudes and decide automatically. Default 0.
+        soft_eviction: When True, low-importance tokens are quantized at 1-bit instead
+            of being zeroed. The returned attention mask is all-ones (no tokens removed).
+            Default False (hard eviction).
         adaptive_context: Scale eviction rate down for short prefixes (seq < 1024).
             Default False.
         verbose: Print stats on exit.
@@ -627,6 +631,7 @@ def nexusquant_evict(
         protected_layers=protected_layers,
         protect_boundary=protect_boundary,
         min_context_for_compression=min_context_for_compression,
+        soft_eviction=soft_eviction,
         adaptive_context=adaptive_context,
     )
     compressor.last_mask = None       # set on first prefill (masking path)

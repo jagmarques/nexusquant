@@ -40,7 +40,7 @@ image = (
     .add_local_dir(nq_local, remote_path="/root/nexusquant")
 )
 
-HF_SECRET = modal.Secret.from_dict({"HF_TOKEN": "os.environ.get("HF_TOKEN", "")"})
+HF_SECRET = modal.Secret.from_dict({"HF_TOKEN": os.environ.get("HF_TOKEN", "")})
 
 # ---------------------------------------------------------------------------
 # Task registry: name → (metric, max_new_tokens, is_outlier_sensitive)

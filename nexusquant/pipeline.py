@@ -621,7 +621,7 @@ class NexusQuantEvict:
         # Normalize importance to a probability distribution
         probs = importance[0] / (importance[0].sum() + 1e-8)
         entropy = -(probs * (probs + 1e-8).log()).sum().item()
-        max_entropy = math.log(seq)  # uniform distribution entropy
+        max_entropy = math.log(max(seq, 2))  # guard: log(1)=0 would cause div-by-zero
         normalized_entropy = entropy / max_entropy  # 0 = peaked, 1 = uniform
 
         # Map entropy to eviction rate:
@@ -677,6 +677,11 @@ class NexusQuantEvict:
         """
         if eviction_rate is None:
             eviction_rate = self.eviction_rate  # backward-compat default
+        if not isinstance(eviction_rate, (int, float)):
+            raise ValueError(
+                f"_build_keep_mask requires a resolved float eviction_rate, got {eviction_rate!r}. "
+                "If self.eviction_rate == 'auto', resolve it via _compute_adaptive_eviction_rate() first."
+            )
         b = importance.shape[0]
         device = importance.device
 
@@ -844,9 +849,10 @@ class NexusQuantEvict:
             v = v * mask_4d
 
             # Protected layers: keep FP16 after eviction, skip quantization
+            # Note: k and v were already multiplied by mask_4d above (lines 843-844).
             if l in skip_layers:
-                k_out = (k * mask_4d).to(dtype=torch.float16, device=device)
-                v_out = (v * mask_4d).to(dtype=torch.float16, device=device)
+                k_out = k.to(dtype=torch.float16, device=device)
+                v_out = v.to(dtype=torch.float16, device=device)
                 _set_layer_kv(past_key_values, l, k_out, v_out)
                 continue
 
