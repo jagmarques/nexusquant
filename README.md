@@ -13,6 +13,8 @@
 
 ---
 
+> **Early-stage research project.** Results validated on Mistral-7B and Phi-3-mini only. NIAH testing shows factual recall degrades under compression (40% at 35% eviction). Not production-ready. Contributions and feedback welcome.
+
 Token eviction + E8 lattice quantization, applied once after prefill. No training, no calibration data, no model modifications.
 
 ## Install
