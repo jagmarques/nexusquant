@@ -679,6 +679,94 @@ so NexusQuant is not yet deployment-ready on Qwen-family models.
 Practitioners must test boundary protection on each target architecture
 before relying on default presets.
 
+\subsection{Soft Eviction: A Negative Result}
+\label{sec:soft_eviction}
+
+Instead of masking evicted tokens to $-\infty$, one might apply \emph{soft eviction}:
+down-quantize the evicted tokens to 1-bit and keep them in the cache, reasoning
+that a degraded signal is better than no signal. We tested this hypothesis directly.
+
+\paragraph{Hardware and setup.}
+All experiments in this subsection run on Cerebrium A10, 1742-token prefix,
+Mistral-7B-v0.1, K3V2 asymmetric quantization. The baseline is standard hard
+eviction (mask to $-\infty$). Soft eviction quantizes evicted tokens to 1-bit
+E8 before keeping them.
+
+\begin{table}[h]
+\centering
+\caption{\textbf{Soft eviction vs.\ hard eviction on Mistral-7B
+  (Cerebrium A10, 1742-tok prefix, K3V2).} Hard eviction masks evicted tokens
+  to $-\infty$. Soft eviction applies 1-bit E8 VQ to evicted tokens and
+  retains them. Lower PPL$\Delta$ is better.}
+\label{tab:soft_eviction}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+Method & Evict\,\% & PPL$\Delta$ \\
+\midrule
+Hard eviction (mask)   & 35\,\% & $+0.82$\,\% \\
+Soft eviction (1-bit)  & 35\,\% & $+2.24$\,\% \\
+\midrule
+Hard eviction (mask)   & 60\,\% & $+1.22$\,\% \\
+Soft eviction (1-bit)  & 60\,\% & $+2.39$\,\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Soft eviction is consistently \emph{worse} than hard eviction (Table~\ref{tab:soft_eviction}):
+$+2.24$\,\% vs.\ $+0.82$\,\% at 35\,\% and $+2.39$\,\% vs.\ $+1.22$\,\% at 60\,\%.
+The failure mode is straightforward: 1-bit quantized tokens retain enough structure
+to receive nonzero softmax weight, but their vectors are severely corrupted, so
+the attention output weighted by these tokens carries noise rather than signal.
+Masking to $-\infty$ prevents this entirely---the softmax renormalizes only over
+the retained set, and no corrupted signal contaminates the output.
+This is consistent with the zero-fill failure mode documented in
+Appendix~\ref{app:neg_ppl}: when evicted tokens contribute weight, quality
+degrades. Soft eviction reintroduces this failure mode in a milder form but
+does not escape it. We do not recommend soft eviction.
+
+\subsection{Graduated Layer Profile: A Small Consistent Win}
+\label{sec:graduated}
+
+Boundary layers (first and last transformer blocks) carry disproportionately
+concentrated representations: the first layers process raw token embeddings
+and the last layers project into vocabulary space. We tested whether
+giving boundary layers 3-bit V quantization---rather than the standard 2-bit V---
+while keeping interior layers at K3V2 improves quality at negligible ratio cost.
+
+\paragraph{Hardware and setup.}
+Same as Section~\ref{sec:soft_eviction}: Cerebrium A10, 1742-token prefix,
+Mistral-7B-v0.1. ``Graduated'' profile: first and last 2 layers use K3V3;
+all remaining layers use K3V2.
+
+\begin{table}[h]
+\centering
+\caption{\textbf{Graduated layer profile on Mistral-7B
+  (Cerebrium A10, 1742-tok prefix).} Uniform = all layers K3V2.
+  Graduated = boundary 2 layers K3V3, remainder K3V2.}
+\label{tab:graduated}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+Profile & Evict\,\% & PPL$\Delta$ \\
+\midrule
+Uniform (K3V2)        & 35\,\% & $+0.82$\,\% \\
+Graduated (K3V2+K3V3) & 35\,\% & $+0.80$\,\% \\
+\midrule
+Uniform (K3V2)        & 60\,\% & $+1.22$\,\% \\
+Graduated (K3V2+K3V3) & 60\,\% & $+1.17$\,\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The graduated profile gives a small but consistent quality improvement:
+$-0.02$\,pp at 35\,\% eviction and $-0.05$\,pp at 60\,\% (Table~\ref{tab:graduated}).
+The improvement is modest because only 4 of 32 layers receive elevated precision,
+limiting the effect to $\approx$12\,\% of the parameter budget. Nevertheless,
+the direction is consistent and aligns with the boundary-layer sensitivity
+observed in Qwen-family models (Section~\ref{sec:asymmetric}).
+We include this as evidence that layer-adaptive bit allocation is a promising
+direction; larger gains likely require per-layer profiling beyond the
+two-endpoint heuristic tested here.
+
 \subsection{Comparison with Published Methods}
 \label{sec:sota}
 

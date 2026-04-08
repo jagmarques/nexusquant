@@ -52,4 +52,40 @@ TurboQuant+ (TheTom) independently arrived at 3-bit keys + 2-bit values from a c
 - **Use real scorer** when you can load with `attn_implementation='eager'`
 - **Skip K4V2** — diminishing returns, not worth the ratio cost
 
+## Latest experiments: what we tried after publishing the K3V2 findings
+
+We ran two more experiments on Cerebrium A10 (Mistral-7B, 1742-token prefix) to follow up on the asymmetric KV results. One worked, one did not.
+
+### Soft eviction: it made things worse
+
+The idea seemed reasonable. Instead of masking evicted tokens to `-inf`, quantize them to 1-bit and keep them. A noisy signal might still carry useful information. It does not.
+
+| Method | Eviction | PPL delta |
+|--------|----------|-----------|
+| Hard eviction (mask) | 35% | +0.82% |
+| Soft eviction (1-bit) | 35% | +2.24% |
+| Hard eviction (mask) | 60% | +1.22% |
+| Soft eviction (1-bit) | 60% | +2.39% |
+
+Soft eviction is 2.7x worse at 35% and 2.0x worse at 60%. The failure mode is the same one we documented for zero-fill: when evicted tokens receive nonzero softmax weight, their corrupted vectors contaminate the attention output. 1-bit quantization is not aggressive enough to suppress the noise but is aggressive enough to corrupt the signal. Masking wins because it gives softmax nothing to renormalize over at those positions.
+
+The lesson is consistent with what we found earlier: the right way to think about eviction is that evicted tokens should not exist from the model's perspective, not that they should exist in degraded form. If you need a softer version of eviction, use a lower eviction rate, not a noisier token representation.
+
+### Graduated layer profile: a real but small improvement
+
+Boundary layers handle different representations than interior layers. The first layers process token embeddings directly; the last layers project into vocabulary space. Both are more sensitive to quantization noise than the middle layers that do the bulk of contextual processing.
+
+We tested giving the boundary layers (first and last 2 of 32) 3-bit values instead of the standard 2-bit, while keeping everything else at K3V2. The result:
+
+| Profile | Eviction | PPL delta |
+|---------|----------|-----------|
+| Uniform K3V2 | 35% | +0.82% |
+| Graduated | 35% | +0.80% |
+| Uniform K3V2 | 60% | +1.22% |
+| Graduated | 60% | +1.17% |
+
+Small but consistent: -0.02pp at 35% and -0.05pp at 60%. The effect is modest because only 4 of 32 layers receive elevated precision. What makes it interesting is that the direction is reliable across both eviction rates, and it aligns with the boundary-layer sensitivity we already see in Qwen-family models.
+
+The practical recommendation: if you are running K3V2 at 60% eviction and want to squeeze out a bit more quality, `graduated=True` is worth trying. If you are building a system that needs bigger quality gains from layer-adaptive allocation, you need per-layer profiling rather than the two-endpoint heuristic we used here.
+
 Code: https://github.com/jagmarques/nexusquant
