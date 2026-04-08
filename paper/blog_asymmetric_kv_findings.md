@@ -1,6 +1,6 @@
 # Why 3-bit keys + 2-bit values beats symmetric 2-bit: GPU-validated asymmetric KV cache compression
 
-We've been running a lot of GPU experiments on KV cache compression, and one finding keeps surprising people: **keys need fundamentally different treatment than values**.
+We've been running a lot of GPU experiments on KV cache compression, and one finding keeps surprising people: **keys need more bits than values**.
 
 ## The scorer result: zero degradation at 35% eviction
 
