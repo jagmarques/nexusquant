@@ -916,6 +916,97 @@ We include this as evidence that layer-adaptive bit allocation is a promising
 direction; larger gains likely require per-layer profiling beyond the
 two-endpoint heuristic tested here.
 
+%------------------------------------------------------------------
+\section{Beyond Perplexity: Needle-In-A-Haystack Evaluation}
+\label{sec:niah}
+%------------------------------------------------------------------
+
+Perplexity measures average next-token prediction quality across a passage.
+We evaluate whether this aggregate metric is sufficient to characterise
+NexusQuant's practical utility by running a needle-in-a-haystack (NIAH) probe
+on Mistral-7B-Instruct-v0.2 (Cerebrium L4, 2026-04-08).
+
+\paragraph{Setup.}
+We insert a single factual ``needle'' sentence at controlled positions within a
+longer filler context and ask the model to retrieve the fact after processing the
+full context.
+Needle positions are parameterised as a fraction of context length:
+position 0.1 places the needle at the beginning of the context;
+position 0.9 places it near the end.
+We test three context lengths (1024, 2048, and 3072 tokens) and two NexusQuant
+configurations: K3V2 with 35\,\% eviction and K3V2 with 60\,\% eviction.
+The baseline is FP16 uncompressed inference.
+
+\begin{table}[h]
+\centering
+\caption{NIAH recall accuracy (\%). Baseline achieves perfect recall; KV compression significantly degrades factual retrieval despite minimal PPL impact (+0.82\%).}
+\label{tab:niah}
+\begin{tabular}{lcccr}
+\toprule
+Config & ctx=1024 & ctx=2048 & ctx=3072 & Overall \\
+\midrule
+Baseline & 100 & 100 & 100 & 100 \\
+K3V2 35\% & 60 & 40 & 20 & 40 \\
+K3V2 60\% & 60 & 40 & 60 & 53 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{The PPL--NIAH gap.}
+The most important finding here is the disconnect between perplexity and factual
+retrieval.
+K3V2 with 35\,\% eviction at a 1742-token prefix yields $+0.82$\,\% PPL
+degradation---within our ``Safe $<$1\,\%'' tier by the perplexity metric.
+Yet NIAH recall at the same configuration collapses to 40\,\% overall.
+This is not a borderline failure: a 60-percentage-point drop in factual recall
+is operationally unacceptable in any retrieval-sensitive deployment.
+PPL is an average loss over the full token sequence; losing a few specific
+tokens barely moves the average.
+NIAH is a worst-case factual retrieval probe: a single evicted needle token
+destroys the answer entirely.
+These metrics measure fundamentally different things, and the PPL result on its
+own is misleading about real-world utility.
+
+\paragraph{Position dependence and the scorer's observation window.}
+The NIAH results exhibit a strong position effect.
+The needle placed at position 0.9 (recent context, near the end) usually
+survives compression; the needle at position 0.1 (early context) always fails.
+This is a direct consequence of how the key-key proxy scorer works: it
+aggregates attention over the last $w_\text{obs}{=}32$ query positions
+(the observation window).
+Recent tokens fall within or near this window and receive high importance
+scores; early tokens, regardless of their content, receive low scores simply
+because they are outside the window.
+The BOS token (position 0) is protected by an infinite score, but no other
+early token receives this treatment.
+A factual needle inserted early in the context is structurally indistinguishable
+from low-importance filler to the current scorer.
+
+\paragraph{Context length degrades recall for K3V2-35\%.}
+For K3V2 with 35\,\% eviction, recall degrades monotonically with context length:
+60\,\% at ctx=1024, 40\,\% at ctx=2048, 20\,\% at ctx=3072.
+As the context grows, early-inserted needles occupy an even smaller fraction of
+the window-visible positions, making them increasingly likely to be evicted.
+The fact that K3V2 with 60\,\% eviction slightly outperforms K3V2 with 35\,\%
+at ctx=3072 (60\,\% vs.\ 20\,\% recall) is most likely noise given the small
+evaluation set, but it illustrates that the eviction rate alone is not the
+primary determinant---the scorer's ability to identify genuinely important
+early tokens matters more.
+
+\paragraph{Implications for scoring.}
+These results are a direct argument for the real attention scorer
+(Section~\ref{sec:real_scorer}).
+The key-key proxy scorer's observation window creates a structural bias against
+early-context tokens, regardless of their importance.
+The real scorer, which accumulates true softmax attention weights across all
+layers and query positions during prefill, is not confined to a local window
+and can assign high importance to a needle at any position.
+Position-aware eviction strategies---for example, computing importance as a
+function of both score and position, or protecting a budget of early-context
+tokens regardless of score---are a natural mitigation we leave to future work.
+Any serious deployment of NexusQuant in retrieval-heavy workloads should
+evaluate NIAH recall, not only perplexity, before choosing an eviction rate.
+
 \subsection{Comparison with Published Methods}
 \label{sec:sota}
 
@@ -1044,6 +1135,29 @@ We document all known limitations of the current work.
     quality but is not a perfect proxy. The QA evaluations (Section~\ref{sec:qa})
     confirm factual recall is preserved at 10$\times$, but full LongBench
     evaluation remains for future work.
+
+  \item \textbf{PPL vs.\ downstream task metrics: a hard gap.}
+    Section~\ref{sec:niah} documents the clearest failure of PPL as a
+    quality indicator: K3V2 at 35\,\% eviction scores $+0.82$\,\% PPL
+    (``safe'') yet achieves only 40\,\% NIAH recall.
+    PPL measures average next-token prediction---losing a few specific tokens
+    barely moves the average over a 4K-token passage.
+    NIAH measures worst-case factual recall---one evicted needle token
+    destroys the answer.
+    Any KV compression method that reports only perplexity is presenting an
+    incomplete picture.
+    The honest position for NexusQuant is this: the current pipeline
+    preserves statistical language quality (as measured by PPL) but can
+    damage specific fact recall in retrieval-sensitive applications,
+    particularly for facts located early in the context.
+    Users with retrieval workloads must evaluate NIAH or equivalent
+    task-specific probes at their target configuration before deployment.
+
+  \item \textbf{GSM8K reasoning evaluation.}
+    GSM8K reasoning evaluation was attempted but the baseline model achieved
+    0\,\% accuracy with the current prompt format, making the comparison
+    invalid.
+    Proper few-shot evaluation is future work.
 \end{enumerate}
 
 %------------------------------------------------------------------
@@ -1097,6 +1211,24 @@ models. The most immediate next step is combining the real attention scorer
 the first and last $w$ tokens regardless of score), which we expect to push
 the near-lossless ($<$0.5\,\% PPL) operating point below $9\times$ compression
 while keeping the pipeline training-free.
+
+\paragraph{Honest limitations: what PPL does not capture.}
+The needle-in-a-haystack evaluation (Section~\ref{sec:niah}) exposes a
+structural limitation of the current approach that perplexity numbers obscure.
+At 35\,\% eviction---our ``Safe $<$1\,\%'' configuration---NIAH factual
+recall drops to 40\,\%.
+This happens because the key-key proxy scorer's observation window assigns low
+importance to early-context tokens regardless of their content; a factual
+needle inserted early is evicted just as readily as unimportant filler.
+Fixing this requires a position-aware scorer or explicit early-context
+protection, not a better quantizer.
+The NIAH result is not a corner case: it represents the standard failure mode
+of any window-based importance scorer applied to retrieval-sensitive workloads.
+We report it prominently because hiding it behind a good PPL number would
+misrepresent the pipeline's readiness for production retrieval tasks.
+Improving NIAH recall under compression---without sacrificing the
+compression ratio gains demonstrated here---is the most important open
+problem in this work.
 
 %------------------------------------------------------------------
 \section*{Broader Impact}
