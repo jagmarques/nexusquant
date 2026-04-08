@@ -535,6 +535,7 @@ def nexusquant_evict(
     adaptive_context: bool = False,
     protected_positions: Optional[torch.Tensor] = None,
     compress_layers: str = "all",
+    layer_bit_profile: str = "uniform",
     verbose: bool = True,
 ):
     """Compress KV cache with attention-aware token eviction + E8 quantization.
@@ -679,7 +680,12 @@ def nexusquant_evict(
         soft_eviction=soft_eviction,
         adaptive_context=adaptive_context,
         protected_positions=protected_positions,
+        compress_layers=compress_layers,
+        layer_bit_profile=layer_bit_profile,
     )
+    # Wire up model config for attention-type-aware compression
+    if compress_layers == "global_only":
+        compressor.set_model_config(model.config)
     compressor.last_mask = None       # set on first prefill (masking path)
     compressor.next_position = None   # set on first prefill (truncation path)
 

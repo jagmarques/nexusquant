@@ -460,6 +460,7 @@ class NexusQuantEvict:
         adaptive_context: bool = False,
         protected_positions: Optional[torch.Tensor] = None,
         compress_layers: str = "all",
+        layer_bit_profile: str = "uniform",
     ):
         """
         Args:
@@ -545,6 +546,7 @@ class NexusQuantEvict:
         self.adaptive_context = adaptive_context
         self.protected_positions = protected_positions  # Optional[torch.Tensor] of position indices
         self.compress_layers = compress_layers  # "all" or "global_only"
+        self.layer_bit_profile = layer_bit_profile  # "uniform" or "graduated"
         self._swa_layer_indices = None  # cached set of SWA layer indices
         self.H = hadamard_matrix(head_dim)
 
@@ -589,6 +591,22 @@ class NexusQuantEvict:
                 swa_layers.add(i)
 
         self._swa_layer_indices = swa_layers
+
+    def _resolve_layer_levels(self, layer_idx: int, n_layers: int):
+        """Get key/value quantization levels for a specific layer.
+
+        With layer_bit_profile="graduated", boundary layers (first/last 15%)
+        get 3-bit for both K and V, while middle layers use the configured
+        key_levels/value_levels (typically K3V2). This is inspired by the
+        APEX weight quant approach where layer-wise precision beats uniform.
+
+        Returns (key_levels, value_levels) for this layer.
+        """
+        if self.layer_bit_profile == "graduated":
+            boundary_count = max(1, int(n_layers * 0.15))
+            if layer_idx < boundary_count or layer_idx >= n_layers - boundary_count:
+                return 8, 8  # 3-bit K, 3-bit V for boundary layers
+        return self.key_levels, self.value_levels
 
     def _score_importance(self, keys: torch.Tensor) -> torch.Tensor:
         """Score token importance via key–key attention (SnapKV-style).
@@ -882,6 +900,9 @@ class NexusQuantEvict:
                     _set_layer_kv(past_key_values, l, k.half(), v.half())
                     continue
 
+                # Resolve per-layer levels
+                lkl, lvl = self._resolve_layer_levels(l, n_layers)
+
                 # --- Keys: RoPE removal -> Hadamard -> dual-precision E8 -> inv Hadamard -> re-RoPE ---
                 k_out_batches = []
                 for bi in range(b):
@@ -890,7 +911,7 @@ class NexusQuantEvict:
                     k_rot = torch.einsum('hsd,de->hse', k_nr, H)                                 # (h, seq, d)
                     k_flat = k_rot.reshape(-1, d)                                                 # (h*seq, d)
                     # Full precision for important tokens; 1-bit for soft-evicted tokens
-                    k_q_full = E8Lattice.quantize_perhead(k_flat, levels=self.key_levels)        # (h*seq, d)
+                    k_q_full = E8Lattice.quantize_perhead(k_flat, levels=lkl)                    # (h*seq, d)
                     k_q_1bit = E8Lattice.quantize_perhead(k_flat, levels=2)                      # (h*seq, d)
                     # keep_flat: 1.0 where important, 0.0 where soft-evicted
                     keep_flat = mask_4d[bi].expand(h, seq, 1).reshape(h * seq, 1)               # (h*seq, 1)
@@ -903,7 +924,7 @@ class NexusQuantEvict:
                 # --- Values: Hadamard -> dual-precision E8 -> inv Hadamard ---
                 v_rot = torch.einsum('bhsd,de->bhse', v, H)                                      # (b, h, seq, d)
                 v_flat = v_rot.reshape(-1, d)                                                     # (b*h*seq, d)
-                v_q_full = E8Lattice.quantize_perhead(v_flat, levels=self.value_levels)          # (b*h*seq, d)
+                v_q_full = E8Lattice.quantize_perhead(v_flat, levels=lvl)                          # (b*h*seq, d)
                 v_q_1bit = E8Lattice.quantize_perhead(v_flat, levels=2)                          # (b*h*seq, d)
                 keep_v_flat = mask_4d.expand(b, h, seq, 1).reshape(b * h * seq, 1)              # (b*h*seq, 1)
                 v_q = v_q_full * keep_v_flat + v_q_1bit * (1.0 - keep_v_flat)                   # (b*h*seq, d)
@@ -932,6 +953,10 @@ class NexusQuantEvict:
                 _set_layer_kv(past_key_values, l, k_out, v_out)
                 continue
 
+            # Resolve per-layer quantization levels (graduated profile gives
+            # boundary layers more bits than middle layers)
+            lkl, lvl = self._resolve_layer_levels(l, n_layers)
+
             # --- Keys: RoPE removal -> Hadamard -> E8 -> inv Hadamard -> re-RoPE ---
             k_out_batches = []
             for bi in range(b):
@@ -939,7 +964,7 @@ class NexusQuantEvict:
                 k_nr = inverse_rope(k_bi, base=rope_base)                                   # (h, seq, d)
                 k_rot = torch.einsum('hsd,de->hse', k_nr, H)                               # (h, seq, d)
                 k_flat = k_rot.reshape(-1, d)                                               # (h*seq, d)
-                k_q = E8Lattice.quantize_perhead(k_flat, levels=self.key_levels)            # (h*seq, d)
+                k_q = E8Lattice.quantize_perhead(k_flat, levels=lkl)                        # (h*seq, d)
                 k_back = torch.einsum('hsd,ed->hse', k_q.reshape(h, seq, d), H)            # (h, seq, d)
                 k_roped = forward_rope(k_back, base=rope_base)                              # (h, seq, d)
                 k_out_batches.append(k_roped)
@@ -948,7 +973,7 @@ class NexusQuantEvict:
             # --- Values: Hadamard -> E8 -> inv Hadamard ---
             v_rot = torch.einsum('bhsd,de->bhse', v, H)                                    # (b, h, seq, d)
             v_flat = v_rot.reshape(-1, d)                                                   # (b*h*seq, d)
-            v_q = E8Lattice.quantize_perhead(v_flat, levels=self.value_levels)             # (b*h*seq, d)
+            v_q = E8Lattice.quantize_perhead(v_flat, levels=lvl)                           # (b*h*seq, d)
             v_out = torch.einsum('bhsd,ed->bhse', v_q.reshape(b, h, seq, d), H
                                  ).to(dtype=torch.float16, device=device)
 
@@ -1081,18 +1106,18 @@ class NexusQuantEvictTruncate(NexusQuantEvict):
                               v_kept.to(dtype=torch.float16, device=device))
                 continue
 
+            # Resolve per-layer levels
+            lkl, lvl = self._resolve_layer_levels(l, n_layers)
+
             # --- Keys: strip RoPE at original positions, re-apply at contiguous positions ---
             k_out_batches = []
             for bi in range(b):
                 k_bi = k_kept[bi]   # (h, n_kept, d)
-                # Remove RoPE encoded at the original non-contiguous positions
                 k_nr = inverse_rope_at_positions(k_bi, orig_positions, base=rope_base)
-                # Hadamard + E8 quantization
                 k_rot = torch.einsum('hsd,de->hse', k_nr, H)
                 k_flat = k_rot.reshape(-1, d)
-                k_q = E8Lattice.quantize_perhead(k_flat, levels=self.key_levels)
+                k_q = E8Lattice.quantize_perhead(k_flat, levels=lkl)
                 k_back = torch.einsum('hsd,ed->hse', k_q.reshape(h, n_kept, d), H)
-                # Re-apply RoPE at contiguous positions [0, 1, ..., n_kept-1]
                 k_roped = forward_rope_at_positions(k_back, new_positions, base=rope_base)
                 k_out_batches.append(k_roped)
             k_out = torch.stack(k_out_batches, dim=0).to(dtype=torch.float16, device=device)
@@ -1100,7 +1125,7 @@ class NexusQuantEvictTruncate(NexusQuantEvict):
             # --- Values: Hadamard + E8 (no RoPE on values) ---
             v_rot = torch.einsum('bhsd,de->bhse', v_kept, H)
             v_flat = v_rot.reshape(-1, d)
-            v_q = E8Lattice.quantize_perhead(v_flat, levels=self.value_levels)
+            v_q = E8Lattice.quantize_perhead(v_flat, levels=lvl)
             v_out = torch.einsum('bhsd,ed->bhse', v_q.reshape(b, h, n_kept, d), H
                                  ).to(dtype=torch.float16, device=device)
 
