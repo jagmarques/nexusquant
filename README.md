@@ -51,7 +51,9 @@ Measured on Mistral-7B, Phi-3-mini, Qwen2.5-7B. Compression ratios include all o
 | `balanced` | ~17x | ~1.3% | K2V2 + 60% evict |
 | `max` | ~33x | +0.66% | K2V2 + real scorer + 80% evict |
 
-**NEW:** Asymmetric K/V compression (3-bit keys, 2-bit values) and real attention scorer dramatically improve quality. GPU-validated on Mistral-7B, Phi-3-mini, and Qwen2.5-7B across A100 and A10.
+**Important: PPL alone does not tell the full quality story.** Our NIAH (needle-in-a-haystack) tests show 40% factual recall at K3V2-35% despite only +0.82% PPL. The key-key scorer can evict early-context tokens containing critical facts. Multi-window scoring (first-16 + last-16 queries) improves NIAH to 80% and PPL to +0.57% at 35% eviction. See Limitations below.
+
+Attention sharpening (scaling keys by sqrt(1.05) after quantization) gives a free +0.05pp quality improvement at zero compression cost. Enabled by default.
 
 ### Cross-architecture results (Cerebrium A10)
 
@@ -130,8 +132,9 @@ with nexusquant_evict(model, soft_eviction=True):  # not recommended
 - **Short prefixes hurt.** Prefixes under 500 tokens see more degradation. The scorer needs enough tokens to distinguish signal from noise.
 - **Architecture-dependent boundary protection.** Qwen-family models catastrophically fail without `protect_boundary=2`. Mistral and Phi-3 work without it. Always test your specific model.
 - **E8 quantization is CPU-bound.** Triton GPU kernel is written (`nexusquant/kernels/e8_triton.py`) but not yet benchmarked for latency. Physical KV truncation (`truncate=True`) is implemented for actual VRAM savings.
-- **Eviction is permanent.** Evicted tokens are gone. If your task requires precise recall of a specific token, measure eviction sensitivity first.
-- **Results on 7B-class models only.** 70B validation pending.
+- **Eviction hurts factual recall.** NIAH benchmark: baseline 100%, K3V2-35% eviction 40% recall, K3V2-60% eviction 53% recall (Mistral-7B-Instruct, ctx=1024-3072). PPL (+0.82%) hides this damage. Multi-window scoring improves recall to 80% at 35% eviction. If your task requires precise fact retrieval, test with NIAH before deploying.
+- **PPL is not a sufficient quality metric.** Always validate with NIAH or downstream accuracy benchmarks. PPL averages over all positions and masks the loss of specific tokens.
+- **Results on 7B-class models only.** 70B validation pending. Mistral-7B quantizes "exceptionally well" (ikawrakow) and is not representative of harder models.
 - **Batch size > 1 is partially broken.** `NexusQuantSimple` only compresses batch index 0; other batch elements are silently dropped to the first element's compressed result. `NexusQuantEvictTruncate` computes one keep-mask from batch element 0 and applies it to all sequences  - incorrect when sequences differ in importance. Validate batch inference results carefully.
 - **Multi-turn chat (persistent KV cache) is not supported.** The hook compresses on every incoming prefill (seq > 1). If the same cache is reused across conversation turns, the second turn's user message triggers re-compression of an already-quantized cache. Use a fresh context manager per turn, or call `model.generate` with `past_key_values=None` to reset the cache between turns.
 - **Speculative decoding is not supported.** Speculative decoding writes multiple draft tokens to the KV cache during the decode phase. Because the hook triggers on any batch of >1 new tokens, it will incorrectly fire on draft verification steps, compressing decode-phase tokens.

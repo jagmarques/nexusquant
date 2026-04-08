@@ -52,6 +52,42 @@ The root cause is that Qwen uses dense GQA with tightly coupled layer interactio
 
 ---
 
+## 5. Norm correction after E8 quantization
+
+Scaling the E8 reconstruction to match the original vector's L2 norm. Sounds reasonable. Makes things worse: -0.04pp at 35% eviction, -0.08pp at 60%. The E8 per-head scaling factor already handles magnitude. Adding a second normalization pass introduces rounding errors that compound through the residual stream. (Cerebrium L4, Mistral-7B, 1742-tok, 2026-04-08)
+
+---
+
+## 6. Disabling Hadamard rotation on values
+
+AmesianX's TurboQuant found V rotation hurts when the decode path lacks the inverse rotation. We have the inverse, but tested anyway. Removing Hadamard on values costs -0.07pp at 35% and -0.55pp at 60%. The decorrelation from Hadamard is essential for E8 quantization quality, especially at high eviction where fewer tokens carry the signal. (Cerebrium L4, Mistral-7B, 1742-tok, 2026-04-08)
+
+---
+
+## 7. Per-layer rotation (different Hadamard per layer)
+
+Each layer gets a unique Hadamard via random sign flips, aiming to decorrelate quantization errors across layers. Result: noise. +/-0.015pp, no consistent direction. A single global Hadamard already decorrelates well enough within each head. (Cerebrium L4, Mistral-7B, 1742-tok, 2026-04-08)
+
+---
+
+## 8. Cross-head Hadamard rotation
+
+Apply a second 8x8 Hadamard rotation across KV heads after the per-head Hadamard. Catastrophic: +7186% PPL at 35% eviction. The double rotation with E8 quantization in between destroys the signal. AmesianX does cross-head WHT differently (512-point concatenated), not as a separate second pass. (Cerebrium L4, Mistral-7B, 1742-tok, 2026-04-08)
+
+---
+
+## 9. Protecting first N tokens from eviction
+
+Protecting the first 64 or 128 tokens to preserve early-context facts. Counterintuitively makes NIAH worse (60% to 20%). Protecting early tokens steals eviction budget from mid-context tokens, so needles placed in the middle get evicted instead. The fix for NIAH recall is multi-window scoring (first-16 + last-16 queries), not token protection. (Cerebrium L4, Mistral-7B-Instruct, ctx=1024, 2026-04-08)
+
+---
+
+## 10. NIAH recall with standard key-key scorer
+
+The biggest negative result of this project. At K3V2-35% eviction, PPL shows +0.82% (looks fine). NIAH shows 40% factual recall (not fine). The key-key scorer's 32-token observation window assigns low importance to early-context tokens, which get evicted regardless of their informational value. Multi-window scoring (first-16 + last-16) improves to 80% recall and +0.57% PPL at 35% eviction, but regresses PPL to +2.73% at 60%. There is no free lunch. (Cerebrium L4, Mistral-7B-Instruct, ctx=1024-3072, 2026-04-08)
+
+---
+
 ## Why share this
 
 Negative results take the same GPU time to produce as positive results. They are just as informative. When we read papers that only report what worked, we end up re-running the same failed experiments ourselves -- and so does everyone else.
