@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nexusquant-kv"
-version = "0.4.0"
-description = "Training-free KV cache compression via E8 lattice quantization and attention-aware token eviction"
+version = "0.5.0"
+description = "Training-free KV cache compression (10-33x) via E8 lattice VQ + attention-aware eviction. Asymmetric K/V, real attention scorer, multi-model validated."
 readme = "README.md"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.9"
