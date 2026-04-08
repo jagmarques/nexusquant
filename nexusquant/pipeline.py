@@ -459,6 +459,7 @@ class NexusQuantEvict:
         soft_eviction: bool = False,
         adaptive_context: bool = False,
         protected_positions: Optional[torch.Tensor] = None,
+        compress_layers: str = "all",
     ):
         """
         Args:
@@ -506,6 +507,14 @@ class NexusQuantEvict:
             protected_positions: Optional 1-D tensor of token position indices that
                 must never be evicted (e.g. image token spans in VLMs). Default None.
                 Example: torch.tensor([1, 2, 3, 256, 257]) to protect 5 positions.
+            compress_layers: Which layers to compress. Default "all".
+                "all" -- compress every layer (standard behavior).
+                "global_only" -- only compress global/full-attention layers, skip
+                    sliding-window layers. For hybrid models like Gemma4 (50 SWA +
+                    10 global), this means only the 10 global layers get compressed.
+                    SWA layers have fixed memory cost regardless of context length,
+                    so compressing them wastes quality for minimal savings.
+                    Requires model config to be passed via set_model_config().
         """
         if scorer not in ("key-key", "real"):
             raise ValueError(f"scorer must be 'key-key' or 'real', got {scorer!r}")
@@ -535,7 +544,51 @@ class NexusQuantEvict:
         self.soft_eviction = soft_eviction
         self.adaptive_context = adaptive_context
         self.protected_positions = protected_positions  # Optional[torch.Tensor] of position indices
+        self.compress_layers = compress_layers  # "all" or "global_only"
+        self._swa_layer_indices = None  # cached set of SWA layer indices
         self.H = hadamard_matrix(head_dim)
+
+    def set_model_config(self, model_config):
+        """Set model config for attention-type-aware compression.
+
+        For hybrid models (Gemma4, GLM4), detects which layers use sliding-window
+        attention vs global attention. When compress_layers="global_only", only
+        global layers get compressed.
+
+        Args:
+            model_config: HuggingFace model config object.
+        """
+        if self.compress_layers != "global_only":
+            return
+
+        # Detect SWA layers from config
+        # Gemma4: config.sliding_window_pattern or per-layer attention type
+        swa_layers = set()
+        n_layers = getattr(model_config, 'num_hidden_layers', 32)
+
+        # Method 1: sliding_window_pattern (Gemma4 style)
+        pattern = getattr(model_config, 'sliding_window_pattern', None)
+        if pattern is not None:
+            # pattern is typically an int: every Nth layer is global, rest are SWA
+            for i in range(n_layers):
+                if (i + 1) % pattern != 0:  # non-global layers are SWA
+                    swa_layers.add(i)
+
+        # Method 2: layer_types list (some models)
+        layer_types = getattr(model_config, 'layer_types', None)
+        if layer_types is not None and not swa_layers:
+            for i, lt in enumerate(layer_types):
+                if lt in ('sliding_window', 'local', 'swa'):
+                    swa_layers.add(i)
+
+        # Method 3: num_kv_shared_layers (Gemma4 E-series)
+        n_shared = getattr(model_config, 'num_kv_shared_layers', 0)
+        if n_shared > 0 and not swa_layers:
+            # Shared layers reuse KV from earlier layers, skip them
+            for i in range(n_layers - n_shared, n_layers):
+                swa_layers.add(i)
+
+        self._swa_layer_indices = swa_layers
 
     def _score_importance(self, keys: torch.Tensor) -> torch.Tensor:
         """Score token importance via key–key attention (SnapKV-style).
@@ -798,12 +851,14 @@ class NexusQuantEvict:
         else:
             n_protect = int(self.protect_boundary)
 
-        # Resolve protected layers (boundary shortcut + explicit set)
+        # Resolve protected layers (boundary + explicit + SWA layers for hybrid models)
         skip_layers = set(self.protected_layers)
         if n_protect > 0:
             for i in range(min(n_protect, n_layers)):
                 skip_layers.add(i)
                 skip_layers.add(n_layers - 1 - i)
+        if self.compress_layers == "global_only" and self._swa_layer_indices:
+            skip_layers.update(self._swa_layer_indices)
 
         # Deferred compression: skip entirely when context is too short
         if self.min_context_for_compression > 0 and seq < self.min_context_for_compression:
@@ -998,12 +1053,14 @@ class NexusQuantEvictTruncate(NexusQuantEvict):
         else:
             n_protect = int(self.protect_boundary)
 
-        # Resolve protected layers (boundary shortcut + explicit set)
+        # Resolve protected layers (boundary + explicit + SWA layers for hybrid models)
         skip_layers = set(self.protected_layers)
         if n_protect > 0:
             for i in range(min(n_protect, n_layers)):
                 skip_layers.add(i)
                 skip_layers.add(n_layers - 1 - i)
+        if self.compress_layers == "global_only" and self._swa_layer_indices:
+            skip_layers.update(self._swa_layer_indices)
 
         # Deferred compression: skip entirely when context is too short
         if self.min_context_for_compression > 0 and seq < self.min_context_for_compression:

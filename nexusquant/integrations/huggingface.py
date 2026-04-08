@@ -534,6 +534,7 @@ def nexusquant_evict(
     soft_eviction: bool = False,
     adaptive_context: bool = False,
     protected_positions: Optional[torch.Tensor] = None,
+    compress_layers: str = "all",
     verbose: bool = True,
 ):
     """Compress KV cache with attention-aware token eviction + E8 quantization.
