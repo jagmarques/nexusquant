@@ -614,6 +614,7 @@ K3V8 (8-bit values)   & $-0.11$\,pp, ratio $-1.2\times$ & Use for quality tier \
 Norm correction       & $-0.04$ to $-0.08$\,pp & Do not use \\
 V-rotation off (Hadamard on V disabled) & $+0.07$ to $+0.55$\,pp & Do not use \\
 Per-layer rotation    & $\pm 0.015$\,pp & No effect \\
+Cross-head WHT ($8{\times}8$) & $+7186$\,\% (catastrophic) & Never use \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -623,7 +624,9 @@ always be applied; (2) disabling Hadamard rotation on values degrades quality
 by up to $+0.55$\,pp---confirming that the Hadamard transform is essential for
 value quantization, not just keys; (3) per-layer rotation (rotating each layer
 independently rather than using a shared random matrix) has no measurable effect,
-so the simpler shared-matrix approach is preferred.
+so the simpler shared-matrix approach is preferred; (4) cross-head WHT (applying
+an $8{\times}8$ Hadamard across heads rather than within a single head) is
+catastrophic---PPL increases by $+7186$\,\%---and must never be used.
 
 \subsection{Proxy--Real Scorer Parity at Medium Context}
 \label{sec:proxy_parity}
