@@ -66,13 +66,13 @@ Measured on Mistral-7B, Phi-3-mini, Qwen2.5-7B. Compression ratios include all o
 
 ## How it works
 
-1. **Importance scoring** — rank tokens by attention weight. Two options: key-key proxy (fast, no extra pass) or **real attention scorer** (uses `attn_implementation='eager'`, zero quality loss at 35% eviction)
-2. **Token eviction** — drop lowest-scoring tokens; always keep BOS and a recent sliding window
-3. **RoPE removal** — undo rotary embeddings on keys so they share a common subspace
-4. **Hadamard rotation** — spread energy uniformly across dimensions (handles non-power-of-2 head dims via zero-padding)
-5. **E8 lattice quantization** — quantize 8-float groups onto the E8 root lattice. **Asymmetric:** 3-bit keys + 2-bit values (keys need more precision due to softmax amplification)
-6. **Boundary protection** — optionally keep first/last N layers at FP16 (mandatory for Qwen-family)
-7. **Delta coding + zstd** — consecutive tokens produce similar lattice indices; storing deltas then compressing with zstd yields another 2-3x
+1. **Importance scoring**  - rank tokens by attention weight. Two options: key-key proxy (fast, no extra pass) or **real attention scorer** (uses `attn_implementation='eager'`, zero quality loss at 35% eviction)
+2. **Token eviction**  - drop lowest-scoring tokens; always keep BOS and a recent sliding window
+3. **RoPE removal**  - undo rotary embeddings on keys so they share a common subspace
+4. **Hadamard rotation**  - spread energy uniformly across dimensions (handles non-power-of-2 head dims via zero-padding)
+5. **E8 lattice quantization**  - quantize 8-float groups onto the E8 root lattice. **Asymmetric:** 3-bit keys + 2-bit values (keys need more precision due to softmax amplification)
+6. **Boundary protection**  - optionally keep first/last N layers at FP16 (mandatory for Qwen-family)
+7. **Delta coding + zstd**  - consecutive tokens produce similar lattice indices; storing deltas then compressing with zstd yields another 2-3x
 
 Token eviction reduces *count* (2.5x at 60% eviction). E8 quantization reduces *precision* (~7x after entropy coding). Combined: 17x.
 
@@ -87,7 +87,7 @@ Token eviction reduces *count* (2.5x at 60% eviction). E8 quantization reduces *
 | CommVQ (Apple) | ~8x | ~0% | Yes (retraining) | |
 | Palu | 11x | ~25% rel | Yes (calibration) | |
 
-NexusQuant ratios include token eviction (10-80% of tokens removed). TurboQuant+ ratios are pure quantization without eviction — not directly comparable. Competitor numbers from their papers.
+NexusQuant ratios include token eviction (10-80% of tokens removed). TurboQuant+ ratios are pure quantization without eviction  - not directly comparable. Competitor numbers from their papers.
 
 ## Supported models
 
@@ -101,6 +101,29 @@ Any HuggingFace causal LM using split-half RoPE (the standard since Llama-2):
 
 Not yet supported: models with interleaved RoPE (GPT-NeoX, GPT-J).
 
+## Advanced options
+
+**Graduated layer bit profile** - gives boundary layers (first/last 15%) higher precision (3-bit K+V) while middle layers use standard asymmetric (K3V2). Small but consistent quality win (~0.02pp on Mistral-7B). GPU-validated.
+
+```python
+with nexusquant_evict(model, quality="high", layer_bit_profile="graduated"):
+    output = model.generate(input_ids, max_new_tokens=200)
+```
+
+**Hybrid model compression** - for models like Gemma4 with sliding-window + global attention layers, only compress the global layers (which scale with context). SWA layers have fixed memory cost.
+
+```python
+with nexusquant_evict(model, compress_layers="global_only"):
+    output = model.generate(input_ids, max_new_tokens=200)
+```
+
+**Soft eviction (experimental, not recommended)** - quantizes evicted tokens at 1-bit instead of removing them. In testing, this performed worse than hard eviction (+2.24% vs +0.82% PPL at 35% eviction on Mistral-7B). The 1-bit tokens corrupt attention patterns more than masking them out. Kept for research purposes.
+
+```python
+with nexusquant_evict(model, soft_eviction=True):  # not recommended
+    output = model.generate(input_ids, max_new_tokens=200)
+```
+
 ## Limitations
 
 - **Quality is text-dependent.** Creative/narrative text degrades more than structured/technical text. Test on your actual workload.
@@ -109,7 +132,7 @@ Not yet supported: models with interleaved RoPE (GPT-NeoX, GPT-J).
 - **E8 quantization is CPU-bound.** Triton GPU kernel is written (`nexusquant/kernels/e8_triton.py`) but not yet benchmarked for latency. Physical KV truncation (`truncate=True`) is implemented for actual VRAM savings.
 - **Eviction is permanent.** Evicted tokens are gone. If your task requires precise recall of a specific token, measure eviction sensitivity first.
 - **Results on 7B-class models only.** 70B validation pending.
-- **Batch size > 1 is partially broken.** `NexusQuantSimple` only compresses batch index 0; other batch elements are silently dropped to the first element's compressed result. `NexusQuantEvictTruncate` computes one keep-mask from batch element 0 and applies it to all sequences — incorrect when sequences differ in importance. Validate batch inference results carefully.
+- **Batch size > 1 is partially broken.** `NexusQuantSimple` only compresses batch index 0; other batch elements are silently dropped to the first element's compressed result. `NexusQuantEvictTruncate` computes one keep-mask from batch element 0 and applies it to all sequences  - incorrect when sequences differ in importance. Validate batch inference results carefully.
 - **Multi-turn chat (persistent KV cache) is not supported.** The hook compresses on every incoming prefill (seq > 1). If the same cache is reused across conversation turns, the second turn's user message triggers re-compression of an already-quantized cache. Use a fresh context manager per turn, or call `model.generate` with `past_key_values=None` to reset the cache between turns.
 - **Speculative decoding is not supported.** Speculative decoding writes multiple draft tokens to the KV cache during the decode phase. Because the hook triggers on any batch of >1 new tokens, it will incorrectly fire on draft verification steps, compressing decode-phase tokens.
 - **KV cache offloading is not supported.** `OffloadedCache` (used by HuggingFace's `accelerate` `max_memory` offloading) does not inherit from `DynamicLayer`, so the NexusQuant hooks do not intercept it. Compression silently does nothing when offloading is active.
