@@ -12,7 +12,7 @@ ktransformers is a solid project. It uses FlashInfer for fused attention kernels
 
 The issue is stability above 100K tokens. There are community reports of FlashInfer's block-sparse attention producing CUDA errors or degraded outputs on certain GPU/CUDA version combinations at extreme sequence lengths (128K+). We have not independently reproduced or verified a specific root cause; users should test their own GPU/CUDA/FlashInfer version combination before relying on ktransformers at these lengths. The ktransformers project is actively maintained and may have addressed specific issues since these reports appeared.
 
-More fundamentally, ktransformers doesn't compress the KV cache at all. It makes attention faster, but the cache still grows linearly with sequence length. A 128K-token Llama-3-70B context needs roughly 140 GB of KV cache at float16. That's the whole A100 80GB, no room for weights. You need multiple GPUs just to hold the state, before you've done any useful computation.
+More fundamentally, ktransformers doesn't compress the KV cache at all. It makes attention faster, but the cache still grows linearly with sequence length. A 128K-token Llama-3-70B context needs roughly 42 GB of KV cache at float16 (80 layers, 8 GQA KV heads, head_dim=128). That's already half an A100 80GB before you load the model weights. You need most of your VRAM budget just to hold the state.
 
 ## What NexusQuant Does Instead
 

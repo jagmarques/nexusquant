@@ -35,21 +35,21 @@ with nexusquant_evict(model, quality="balanced"):
 
 | Without NexusQuant | With NexusQuant |
 |---|---|
-| 128K context → 80 GB KV cache | 128K context → 5 GB KV cache (17x) |
-| OOM at 32K on a single A100 | 500K+ tokens on one A100 |
-| Needs 8× A100 cluster for long context | Single GPU, single machine |
+| 128K context on 70B = ~42 GB KV cache (GQA) | Same context = ~2.5 GB KV cache (17x) |
+| KV cache competes with model weights for VRAM | KV cache fits comfortably alongside weights |
+| Long context needs multi-GPU or offloading | Single GPU, single machine |
 | Deploy a fine-tuned retrieval model | One `with` block, no code changes |
 
 ## Quality presets
 
 Measured on Mistral-7B, Phi-3-mini, Qwen2.5-7B. Compression ratios include all overhead.
 
-| Preset | Compression | PPL degradation | Context on 80 GB | Config |
-|---|---|---|---|---|
-| `high` | ~9x | <0.5% | ~1.2M tokens | K3V2 + real scorer + 35% evict |
-| `asym` | ~14x | ~1% | ~1.8M tokens | K3V2 + 60% evict |
-| `balanced` | ~17x | ~1.3% | ~2.2M tokens | K2V2 + 60% evict |
-| `max` | ~33x | +0.66% | ~4.2M tokens | K2V2 + real scorer + 80% evict |
+| Preset | Compression | PPL degradation | Config |
+|---|---|---|---|
+| `high` | ~9x | <0.5% | K3V2 + real scorer + 35% evict |
+| `asym` | ~14x | ~1% | K3V2 + 60% evict |
+| `balanced` | ~17x | ~1.3% | K2V2 + 60% evict |
+| `max` | ~33x | +0.66% | K2V2 + real scorer + 80% evict |
 
 **NEW:** Asymmetric K/V compression (3-bit keys, 2-bit values) and real attention scorer dramatically improve quality. GPU-validated on Mistral-7B, Phi-3-mini, and Qwen2.5-7B across A100 and A10.
 
