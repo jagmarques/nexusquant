@@ -14,13 +14,13 @@ The standard key-key proxy scorer gives +0.66% at 35% and +3.20% at 80%.
 | 60% | +1.07% | +0.16% | -0.91pp |
 | 80% | +3.20% | +0.66% | -2.54pp |
 
-The real scorer runs one prefill forward pass with `output_attentions=True`, accumulates softmax weights column-wise across layers, and averages over heads. Requires `attn_implementation='eager'` — SDPA silently returns `None` for attention weights.
+The real scorer runs one prefill forward pass with `output_attentions=True`, accumulates softmax weights column-wise across layers, and averages over heads. Requires `attn_implementation='eager'`  - SDPA silently returns `None` for attention weights.
 
 ## Why keys need more bits
 
-K3V2 (3-bit keys, 2-bit values) drops PPL delta from +2.26% to +0.35% on Mistral-7B at 35% eviction — a **6x improvement** at 15% ratio cost.
+K3V2 (3-bit keys, 2-bit values) drops PPL delta from +2.26% to +0.35% on Mistral-7B at 35% eviction  - a **6x improvement** at 15% ratio cost.
 
-The mechanism: keys participate in softmax. Quantization noise in keys perturbs the full attention weight matrix — redistributing probability mass across *all* positions. Value noise only scales output proportionally to that value's attention weight. Keys are in the exponent; values are linear.
+The mechanism: keys participate in softmax. Quantization noise in keys perturbs the full attention weight matrix  - redistributing probability mass across *all* positions. Value noise only scales output proportionally to that value's attention weight. Keys are in the exponent; values are linear.
 
 ## Cross-architecture: Mistral, Phi-3, Qwen
 
@@ -37,7 +37,7 @@ The mechanism: keys participate in softmax. Quantization noise in keys perturbs 
 
 ## K4V2: diminishing returns
 
-K4V2 gives +0.76% vs K3V2's +0.82% at 35% eviction — barely any improvement. The bottleneck shifts to value quantization once key precision crosses a threshold. Don't bother with K4V2; spend the bits elsewhere.
+K4V2 gives +0.76% vs K3V2's +0.82% at 35% eviction  - barely any improvement. The bottleneck shifts to value quantization once key precision crosses a threshold. Don't bother with K4V2; spend the bits elsewhere.
 
 ## TurboQuant+ found the same thing
 
@@ -50,7 +50,7 @@ TurboQuant+ (TheTom) independently arrived at 3-bit keys + 2-bit values from a c
 - **Default:** K3V2 (`quality="high"`) for quality-critical tasks
 - **Add `protect_boundary=2`** for Qwen-family models (mandatory)
 - **Use real scorer** when you can load with `attn_implementation='eager'`
-- **Skip K4V2** — diminishing returns, not worth the ratio cost
+- **Skip K4V2**  - diminishing returns, not worth the ratio cost
 
 ## Latest experiments: what we tried after publishing the K3V2 findings
 

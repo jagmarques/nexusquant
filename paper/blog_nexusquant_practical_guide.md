@@ -33,12 +33,12 @@ Hooks into DynamicCache, applies eviction + E8 lattice quantization after prefil
 
 ## Real attention scorer
 
-The default key-key scorer is fast but approximate. The real scorer uses actual softmax weights — at 35% eviction it gives **+0.00% PPL** vs +0.66% for key-key.
+The default key-key scorer is fast but approximate. The real scorer uses actual softmax weights  - at 35% eviction it gives **+0.00% PPL** vs +0.66% for key-key.
 
 ```python
 model = AutoModelForCausalLM.from_pretrained(
     "mistralai/Mistral-7B-v0.1",
-    attn_implementation="eager",  # required — SDPA silently suppresses weights
+    attn_implementation="eager",  # required  - SDPA silently suppresses weights
     torch_dtype=torch.float16,
     device_map="auto",
 )
@@ -122,9 +122,9 @@ print(tokenizer.decode(output[0][input_ids.shape[1]:], skip_special_tokens=True)
 
 ## What's next
 
-- **Triton E8 kernel** — compression is CPU-bound (60-90s). GPU kernel written, benchmarking pending.
-- **LongBench** — full 16-task evaluation with F1 scoring
-- **70B validation** — current results are 7B-class only
-- **arXiv** — NeurIPS 2026 paper in final draft
+- **Triton E8 kernel**  - compression is CPU-bound (60-90s). GPU kernel written, benchmarking pending.
+- **LongBench**  - full 16-task evaluation with F1 scoring
+- **70B validation**  - current results are 7B-class only
+- **arXiv**  - NeurIPS 2026 paper in final draft
 
 Code: https://github.com/jagmarques/nexusquant

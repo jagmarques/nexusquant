@@ -20,7 +20,7 @@ NexusQuant compresses the KV cache itself, not just the attention kernel. The ap
 
 **Token eviction** removes KV entries for tokens that are unlikely to be attended to again. An attention score accumulator tracks which tokens each layer actually uses during prefill. Tokens that fall below a threshold are evicted before the generation loop begins.
 
-**Vector quantization** compresses the surviving KV entries using 2-bit E8 lattice quantization. The E8 lattice is optimal for packing points in 8-dimensional space — it achieves the densest sphere packing in R^8 — which means 2-bit E8 VQ outperforms standard k-means or product quantization at the same bitwidth, with no training required beyond the lattice structure itself.
+**Vector quantization** compresses the surviving KV entries using 2-bit E8 lattice quantization. The E8 lattice is optimal for packing points in 8-dimensional space  - it achieves the densest sphere packing in R^8  - which means 2-bit E8 VQ outperforms standard k-means or product quantization at the same bitwidth, with no training required beyond the lattice structure itself.
 
 These two stages are composed with a few supporting operations:
 
@@ -35,7 +35,7 @@ Prefill → Score → Evict → RoPE removal → Hadamard rotation → 2-bit E8 
 - **E8 VQ**: encode each 8-dim vector to the nearest E8 lattice point at 2 bits/dim
 - **Temporal delta + zstd**: losslessly compress the residuals between consecutive token embeddings
 
-Each stage was validated by ablation. Removing any single stage costs at least 0.7 percentage points of PPL quality or 3.3x compression ratio. The pipeline isn't over-engineered — everything earns its place.
+Each stage was validated by ablation. Removing any single stage costs at least 0.7 percentage points of PPL quality or 3.3x compression ratio. The pipeline isn't over-engineered  - everything earns its place.
 
 ## API
 
@@ -48,7 +48,7 @@ from nexusquant import nexusquant_evict
 model = AutoModelForCausalLM.from_pretrained("mistralai/Mistral-7B-v0.1")
 tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
 
-# Wrap generation — that's it
+# Wrap generation  - that's it
 with nexusquant_evict(model, quality="balanced"):
     outputs = model.generate(input_ids, max_new_tokens=512)
 ```
@@ -72,13 +72,13 @@ All results below are from A100 GPU experiments using the full pipeline. Context
 | Eviction | Ratio | PPL Delta | Validated? |
 |----------|-------|-----------|------------|
 | 35% | 10.4x | +0.43% | GPU-validated |
-| 50% | 13.5x | +0.83% | Interpolated estimate — not GPU-validated |
+| 50% | 13.5x | +0.83% | Interpolated estimate  - not GPU-validated |
 | 60% | 16.8x | +1.34% | GPU-validated |
 | 80% | 33.3x | +2.64% | GPU-validated |
 
-Note: K3V2 (3-bit keys, 2-bit values) at 35% eviction gives +0.35% at 8.89x on the same setup — better quality at slightly lower ratio. See Asymmetric K/V section below.
+Note: K3V2 (3-bit keys, 2-bit values) at 35% eviction gives +0.35% at 8.89x on the same setup  - better quality at slightly lower ratio. See Asymmetric K/V section below.
 
-At 10x compression, factual recall QA is preserved. Nuanced multi-step reasoning questions show partial degradation — the model gets the main facts right but may miss fine-grained details. This is consistent with evicting tokens that carry secondary context.
+At 10x compression, factual recall QA is preserved. Nuanced multi-step reasoning questions show partial degradation  - the model gets the main facts right but may miss fine-grained details. This is consistent with evicting tokens that carry secondary context.
 
 ### Llama-3-8B (A10G, 1494-tok prefix)
 
@@ -91,7 +91,7 @@ Llama-3-8B shows an unusual behavior: compression *improves* PPL compared to bas
 | 2-bit VQ + 60% evict | 16.48x | -1.35% |
 | 2-bit VQ + 80% evict | 32.45x | -0.61% |
 
-We investigated this thoroughly. The negative PPL is an evaluation artifact: the attention mask renormalization after eviction makes the continuation scoring easier by forcing focus on retained tokens, not because the compressed cache is higher quality than the original. The effect is structural — random eviction also improves measured PPL, which confirms it's a renormalization effect rather than smart token selection. The paper reports these numbers with full explanation of the artifact and does not claim compression improves Llama-3 generation quality in deployment.
+We investigated this thoroughly. The negative PPL is an evaluation artifact: the attention mask renormalization after eviction makes the continuation scoring easier by forcing focus on retained tokens, not because the compressed cache is higher quality than the original. The effect is structural  - random eviction also improves measured PPL, which confirms it's a renormalization effect rather than smart token selection. The paper reports these numbers with full explanation of the artifact and does not claim compression improves Llama-3 generation quality in deployment.
 
 The practical implication: Llama-3's GQA architecture is more robust to KV compression than Mistral's full attention, and the compression ratios are real regardless of the PPL artifact.
 
@@ -105,7 +105,7 @@ PPL degradation varies by text domain:
 | Technical | +0.90% | +3.87% | +6.09% |
 | Creative/narrative | +2.48% | +4.62% | +4.73% |
 
-Academic and technical text has long-range structural coherence that eviction preserves well. Creative/narrative text has higher information density per token, so eviction hurts more at low rates — but the degradation curve is flatter at high eviction rates compared to structured text.
+Academic and technical text has long-range structural coherence that eviction preserves well. Creative/narrative text has higher information density per token, so eviction hurts more at low rates  - but the degradation curve is flatter at high eviction rates compared to structured text.
 
 ## Comparison with Other Methods
 
@@ -123,11 +123,11 @@ A few notes on honest reading of this table:
 
 KVTC achieves up to 20x but requires calibration data from the target distribution. If your domain matches their calibration set, the quality numbers are excellent. If it doesn't, expect degradation not reported in their paper. NexusQuant requires zero calibration, which matters when you're working across diverse domains or deploying to arbitrary user inputs.
 
-CommVQ's ~0% PPL degradation is impressive but requires model retraining. That's not a drop-in solution — it's a new model variant. If you're on Mistral-7B-v0.1 and CommVQ was trained on a different checkpoint, you start over.
+CommVQ's ~0% PPL degradation is impressive but requires model retraining. That's not a drop-in solution  - it's a new model variant. If you're on Mistral-7B-v0.1 and CommVQ was trained on a different checkpoint, you start over.
 
 TurboQuant (Google) is the closest comparison to NexusQuant in the "no training required" category, but tops out at ~5-6x. Our `"high"` preset (10x) beats their maximum ratio at better or comparable PPL, and our `"max"` preset (33x) operates in a regime they don't reach.
 
-ktransformers isn't a compression method — it belongs in this table only because it's the tool people reach for when they need long-context performance. The comparison is practical: if you need 128K tokens and you're asking "should I use ktransformers or NexusQuant?", the answer depends on whether you need the KV cache to fit in memory. ktransformers will not help you fit a 128K context into a single 80GB A100. NexusQuant at 10x will.
+ktransformers isn't a compression method  - it belongs in this table only because it's the tool people reach for when they need long-context performance. The comparison is practical: if you need 128K tokens and you're asking "should I use ktransformers or NexusQuant?", the answer depends on whether you need the KV cache to fit in memory. ktransformers will not help you fit a 128K context into a single 80GB A100. NexusQuant at 10x will.
 
 ## Honest Limitations
 
@@ -137,7 +137,7 @@ ktransformers isn't a compression method — it belongs in this table only becau
 
 **Only tested on 7-8B models.** All results above are from Mistral-7B and Llama-3-8B. We have not validated on 70B models. GQA vs. full attention architecture differences may matter more at scale.
 
-**Catastrophic failure at extreme eviction + long context.** At 3K+ token prefixes, eviction rates above 60% produce catastrophic PPL degradation (>40% relative). This is not a scorer bug — it's fundamental capacity loss from removing too much context. The `"max"` preset (80% eviction) is validated at 3544 tokens on A100, but applying it to significantly longer prefixes without domain-specific validation is not recommended.
+**Catastrophic failure at extreme eviction + long context.** At 3K+ token prefixes, eviction rates above 60% produce catastrophic PPL degradation (>40% relative). This is not a scorer bug  - it's fundamental capacity loss from removing too much context. The `"max"` preset (80% eviction) is validated at 3544 tokens on A100, but applying it to significantly longer prefixes without domain-specific validation is not recommended.
 
 **PPL is not the whole story.** Our downstream QA evaluation on 5 tasks shows that 10x compression preserves factual QA performance. We have not run a full LongBench evaluation. PPL can understate quality degradation on tasks requiring precise recall of long-range context.
 
@@ -145,10 +145,10 @@ ktransformers isn't a compression method — it belongs in this table only becau
 
 The Triton E8 VQ GPU kernel and physical KV truncation (`truncate=True`) have shipped. Remaining work:
 
-- **LongBench evaluation** — formal multi-task benchmark (currently only 1/16 tasks completed due to compute constraints)
-- **16K+ context validation** — real-document long-context testing beyond the 3544-tok prefix used in most experiments
-- **70B model validation** — all current results are on 7-8B models
-- **Combined best-config experiment** — real scorer + K3V2 + boundary protection across 35/60/80% eviction rates (these have not been run together end-to-end)
+- **LongBench evaluation**  - formal multi-task benchmark (currently only 1/16 tasks completed due to compute constraints)
+- **16K+ context validation**  - real-document long-context testing beyond the 3544-tok prefix used in most experiments
+- **70B model validation**  - all current results are on 7-8B models
+- **Combined best-config experiment**  - real scorer + K3V2 + boundary protection across 35/60/80% eviction rates (these have not been run together end-to-end)
 - **arXiv submission** after LongBench and combined config are complete
 
 ## Code
