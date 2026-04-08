@@ -1,4 +1,8 @@
 .company/
+.claude/
+.planning/
+COMPANY.md
+CLAUDE.md
 .DS_Store
 __pycache__/
 *.pyc
@@ -12,4 +16,3 @@ __pycache__/
 *.synctex.gz
 paper/*.png
 experiments/_archive/
-.planning/_archive/
