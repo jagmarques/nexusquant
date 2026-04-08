@@ -461,6 +461,7 @@ class NexusQuantEvict:
         protected_positions: Optional[torch.Tensor] = None,
         compress_layers: str = "all",
         layer_bit_profile: str = "uniform",
+        distance_graduated: bool = False,
     ):
         """
         Args:
@@ -547,6 +548,7 @@ class NexusQuantEvict:
         self.protected_positions = protected_positions  # Optional[torch.Tensor] of position indices
         self.compress_layers = compress_layers  # "all" or "global_only"
         self.layer_bit_profile = layer_bit_profile  # "uniform" or "graduated"
+        self.distance_graduated = distance_graduated  # boost recent token importance
         self._swa_layer_indices = None  # cached set of SWA layer indices
         self.H = hadamard_matrix(head_dim)
 
@@ -782,6 +784,18 @@ class NexusQuantEvict:
         # Always keep the sliding window (last sliding_window tokens)
         if self.sliding_window > 0 and seq > 0:
             keep_mask[:, max(0, seq - self.sliding_window):] = True
+
+        # Distance-graduated eviction: boost importance of recent tokens so they
+        # survive eviction more easily. Distant tokens need higher raw importance
+        # to be kept. This is like DCA's idea of treating recent vs distant context
+        # differently, but applied through the importance scores.
+        if getattr(self, 'distance_graduated', False) and prefix_len > 1:
+            # Linear ramp: position 1 gets 0.0 boost, last prefix token gets 1.0 boost
+            ramp = torch.linspace(0.0, 1.0, prefix_len - 1, device=device)
+            # Scale boost to ~25% of max importance so it biases but doesn't dominate
+            boost = ramp * importance[:, 1:prefix_len].max() * 0.25
+            importance = importance.clone()
+            importance[:, 1:prefix_len] = importance[:, 1:prefix_len] + boost
 
         # Keep top-n_keep tokens from the evictable prefix by importance
         if prefix_len > 1 and n_keep > 0:
