@@ -37,6 +37,7 @@ def benchmark():
     try:
         from nexusquant.kernels.e8_triton import (
             e8_decode,
+            e8_dequant_matmul,
             e8_encode,
             e8_nearest_point,
             e8_quantize_perhead,
@@ -198,6 +199,60 @@ def benchmark():
             rmse_l = (x - decoded_l).pow(2).mean().sqrt().item()
             rel_l  = rmse_l / x.pow(2).mean().sqrt().item()
             print(f"  {label:25s}  RMSE={rmse_l:.5f}  ({rel_l:.3%} relative)")
+
+    # ------------------------------------------------------------------ #
+    #  Fused dequant-matmul benchmark (e8_dequant_matmul)                 #
+    # ------------------------------------------------------------------ #
+    if triton_available:
+        print("\n" + "=" * 70)
+        print("  Fused dequant-matmul benchmark  (d=128, Q_cols=128, levels=4)")
+        print("=" * 70)
+        print(f"{'Label':35s}  {'Naive (ms)':>10}  {'Fused (ms)':>11}  {'Speedup':>8}  {'Max err':>10}")
+        print("-" * 70)
+
+        head_dim = 128
+        levels = 4
+
+        kv_sizes = [
+            (1_024,   "1K KV tokens"),
+            (8_192,   "8K KV tokens"),
+            (32_768,  "32K KV tokens"),
+            (131_072, "128K KV tokens"),
+        ]
+
+        for K, label in kv_sizes:
+            # Build quantized KV cache block and query
+            kv = torch.randn(K, head_dim, device="cuda", dtype=torch.float32)
+            codes, scales = e8_encode(kv, levels=levels)   # int8 [K, head_dim], float32 [K]
+            query = torch.randn(head_dim, head_dim, device="cuda", dtype=torch.float32)
+
+            # --- Warmup ---
+            for _ in range(3):
+                decoded = e8_decode(codes, scales, levels=levels, original_head_dim=head_dim)
+                _ = decoded @ query
+                _ = e8_dequant_matmul(codes, scales, query, levels=levels)
+            torch.cuda.synchronize()
+
+            # --- Naive: decode then matmul ---
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            for _ in range(10):
+                decoded = e8_decode(codes, scales, levels=levels, original_head_dim=head_dim)
+                naive_out = decoded @ query
+            torch.cuda.synchronize()
+            naive_ms = (time.perf_counter() - t0) / 10 * 1000
+
+            # --- Fused kernel ---
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            for _ in range(10):
+                fused_out = e8_dequant_matmul(codes, scales, query, levels=levels)
+            torch.cuda.synchronize()
+            fused_ms = (time.perf_counter() - t0) / 10 * 1000
+
+            speedup = naive_ms / fused_ms
+            max_err = (fused_out - naive_out).abs().max().item()
+            print(f"{label:35s}  {naive_ms:>10.2f}  {fused_ms:>11.2f}  {speedup:>7.1f}x  {max_err:>10.6f}")
 
     print("\nBenchmark complete.")
 

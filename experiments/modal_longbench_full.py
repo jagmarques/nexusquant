@@ -73,7 +73,7 @@ TASKS = {
 MAX_EXAMPLES_PER_TASK = 50
 
 
-@app.function(image=image, gpu="A100", timeout=7200, secrets=[HF_SECRET])
+@app.function(image=image, gpu="A100", timeout=10800, secrets=[HF_SECRET])
 def run_longbench():
     import sys
     sys.path.insert(0, "/root")
@@ -183,10 +183,10 @@ def run_longbench():
         try:
             urllib.request.urlretrieve(url, data_zip)
         except Exception as e:
-            # Try alternate URL pattern
-            url2 = "https://huggingface.co/datasets/THUDM/LongBench/resolve/refs%2Fconvert%2Fparquet/default/train/data.zip"
-            print(f"  Primary URL failed ({e}), trying alternate...")
-            urllib.request.urlretrieve(url2, data_zip)
+            raise RuntimeError(
+                f"Failed to download LongBench data from {url}: {e}\n"
+                "Check that the HuggingFace URL is still valid and the container has internet access."
+            ) from e
         with zipfile.ZipFile(data_zip, "r") as z:
             z.extractall(data_dir)
         print(f"  Downloaded and extracted in {time.time()-t0:.1f}s")
@@ -406,7 +406,10 @@ def run_longbench():
         }
         instruction = task_instructions.get(task_name, "Answer based on the context.")
 
-        # Truncate context to avoid OOM (max ~3500 tokens worth of chars)
+        # Truncate context to avoid OOM (max ~3500 tokens worth of chars).
+        # KNOWN LIMITATION: LongBench tasks have 8K-20K token contexts; at 14000
+        # chars (~3500 tokens) we are nowhere near full length. Results here measure
+        # compression quality on truncated inputs, not the full long-context regime.
         MAX_CHARS = 14000
         if len(ctx) > MAX_CHARS:
             ctx = ctx[:MAX_CHARS] + " [... truncated ...]"

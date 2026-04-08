@@ -10,12 +10,18 @@ Design:
   - Eviction rates: [0%, 35%, 50%, 60%, 80%]
   - 2-bit E8 VQ + temporal delta + zstd level 22
   - Memory tracking before/after compression
+  - BOTH scorers: key-key proxy AND real attention weights (side-by-side)
 
 Metrics (per text, then mean ± std):
   - Baseline PPL, compressed PPL, delta (%)
   - Compression ratio (analytic byte counting, ALL overhead: indices + scales + mask)
   - Tokens kept vs total
   - GPU memory allocated before/after
+
+CRITICAL: attn_implementation='eager' is required for real scorer.
+SDPA (the default) returns None for output_attentions regardless of the flag.
+At 8K prefix length, the full attention matrix is ~32 GB in fp32; A100-80GB is
+the minimum GPU that can hold it alongside the model weights.
 """
 import modal
 import os
@@ -274,14 +280,23 @@ def run_8k_16k_validation():
     print(f"\nLoading {model_id}...")
     t0 = time.time()
     tok = AutoTokenizer.from_pretrained(model_id, token=os.environ["HF_TOKEN"])
+    # CRITICAL: attn_implementation='eager' is required so that
+    # output_attentions=True returns real softmax weights.
+    # SDPA (the default) silently returns None for attention weights.
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         torch_dtype=torch.float16,
         device_map="auto",
+        attn_implementation="eager",
         token=os.environ["HF_TOKEN"],
     )
     model.eval()
     print(f"Loaded in {time.time() - t0:.1f}s")
+
+    # Verify eager is active — fail fast rather than silently mis-score.
+    attn_impl = getattr(model.config, "_attn_implementation", "unknown")
+    print(f"attn_implementation: {attn_impl}")
+    assert attn_impl == "eager", f"Expected 'eager', got {attn_impl!r}"
 
     n_layers   = model.config.num_hidden_layers          # 32
     n_kv_heads = model.config.num_key_value_heads        # 8
@@ -391,6 +406,47 @@ def run_8k_16k_validation():
                                          padding=pool_k // 2, stride=1).squeeze()[:seq_len]
             all_imp += layer_imp
         return all_imp / n_layers
+
+    # ------------------------------------------------------------------ Real attention scorer
+    def score_importance_real(prefix_ids):
+        """Real attention scorer: accumulated softmax weights from all layers/heads.
+
+        Runs a single forward pass with output_attentions=True (requires
+        attn_implementation='eager' — already asserted at model load).
+        For each token j, importance[j] = total attention received from all
+        later query positions, averaged across heads and layers.
+
+        Returns a 1-D CPU float tensor of shape (prefix_len,).
+        """
+        device = prefix_ids.device
+        b, seq = prefix_ids.shape
+
+        with torch.no_grad():
+            out = model(
+                prefix_ids,
+                use_cache=False,
+                output_attentions=True,
+            )
+
+        attentions = out.attentions   # tuple of (b, n_heads, seq, seq) per layer
+        if attentions is None or len(attentions) == 0 or attentions[0] is None:
+            raise RuntimeError(
+                "output_attentions=True returned None — model must be loaded with "
+                "attn_implementation='eager'. SDPA suppresses attention weights silently."
+            )
+
+        # Causal column-sum: how much attention each key position received.
+        # Causal mask already zeros upper-triangle, so summing all query rows
+        # gives the correct per-token importance signal.
+        importance = torch.zeros(b, seq, dtype=torch.float32, device=device)
+        n_attn_layers = len(attentions)
+        for layer_attn in attentions:
+            layer_attn = layer_attn.float()          # (b, heads, seq_q, seq_k)
+            col_sum = layer_attn.sum(dim=2)          # (b, heads, seq_k)
+            importance += col_sum.mean(dim=1)        # (b, seq_k), avg over heads
+        importance = importance / n_attn_layers      # avg over layers
+
+        return importance[0].cpu()   # (seq,) on CPU, same shape as score_importance
 
     # ------------------------------------------------------------------ Build keep mask
     def build_keep_mask(prefix_len, evict_pct, importance):
@@ -572,99 +628,154 @@ def run_8k_16k_validation():
             print(f"  Baseline PPL: {baseline_ppl:.4f}  "
                   f"(KV mem: {mem_after_prefill_gb - mem_before_gb:.2f}GB)")
 
-            # Score importance once for this prefix
+            # ----------------------------------------------------------
+            # Pre-compute BOTH importance vectors for this prefix.
+            # key-key: one prefill forward pass (KV cache), CPU tensors.
+            # real:    one forward pass with output_attentions=True (no KV).
+            # ----------------------------------------------------------
+            importance_kk = None
+            importance_real = None
+
+            # --- key-key scorer ---
             try:
                 with torch.no_grad():
                     pout = model(prefix_ids, use_cache=True)
-                importance = score_importance(pout.past_key_values, prefix_len)
+                importance_kk = score_importance(pout.past_key_values, prefix_len)
                 del pout
                 torch.cuda.empty_cache()
             except torch.cuda.OutOfMemoryError:
-                print(f"  OOM during importance scoring — skipping prefix={prefix_len}")
+                print(f"  OOM during key-key scoring — skipping prefix={prefix_len}")
                 torch.cuda.empty_cache()
                 gc.collect()
                 continue
 
-            # Print header for this prefix
-            print(f"\n  {'Config':<14s} {'PPL':>8s} {'Delta%':>9s} {'Ratio':>7s} "
-                  f"{'Kept':>6s} {'MemDelta':>10s}")
-            print(f"  {'-'*60}")
-            print(f"  {'baseline':<14s} {baseline_ppl:8.4f} {'0.00%':>9s} {'N/A':>7s} "
-                  f"{'all':>6s} {'—':>10s}")
-
-            for cfg in eviction_configs:
-                if cfg["evict_pct"] == 0:
-                    continue  # already printed above
-
-                evict_pct = cfg["evict_pct"]
+            # --- real attention scorer ---
+            try:
+                importance_real = score_importance_real(prefix_ids)
                 torch.cuda.empty_cache()
+                print(f"  Real scorer done  "
+                      f"min={importance_real.min():.4f}  max={importance_real.max():.4f}")
+            except torch.cuda.OutOfMemoryError:
+                print(f"  OOM during real scorer — will skip real scorer for this prefix.")
+                torch.cuda.empty_cache()
+                gc.collect()
+                importance_real = None
+            except RuntimeError as e:
+                print(f"  Real scorer failed ({e}) — will skip real scorer.")
+                importance_real = None
 
-                try:
-                    with torch.no_grad():
-                        pout = model(prefix_ids, use_cache=True)
-                        kv   = pout.past_key_values
+            # Build scorer list: always include key-key; include real if it worked.
+            scorers = [("key-key", importance_kk)]
+            if importance_real is not None:
+                scorers.append(("real", importance_real))
 
-                    mem_pre_compress = torch.cuda.memory_allocated() / 1e9
-                    keep_mask        = build_keep_mask(prefix_len, evict_pct, importance)
-                    info, kv         = evict_quantize(kv, keep_mask, prefix_len)
-                    mem_post_compress = torch.cuda.memory_allocated() / 1e9
-                    mem_delta_gb      = mem_post_compress - mem_pre_compress
+            # Print header for this prefix
+            print(f"\n  {'Scorer':<8s} {'Config':<14s} {'PPL':>8s} {'Delta%':>9s} "
+                  f"{'Ratio':>7s} {'Kept':>6s} {'MemDelta':>10s}")
+            print(f"  {'-'*70}")
+            print(f"  {'—':<8s} {'baseline':<14s} {baseline_ppl:8.4f} {'0.00%':>9s} "
+                  f"{'N/A':>7s} {'all':>6s} {'—':>10s}")
 
-                    # Attention mask: 0 for evicted positions in prefix, 1 elsewhere
-                    attn_ctx  = torch.ones(prefix_len, dtype=torch.long, device="cuda")
-                    attn_ctx[~keep_mask] = 0
-                    attn_cont = torch.ones(cont_len, dtype=torch.long, device="cuda")
-                    attn_full = torch.cat([attn_ctx, attn_cont]).unsqueeze(0)
+            for scorer_name, importance in scorers:
+                for cfg in eviction_configs:
+                    if cfg["evict_pct"] == 0:
+                        continue  # already printed above
 
-                    with torch.no_grad():
-                        cout    = model(cont_ids, past_key_values=kv,
-                                        attention_mask=attn_full, use_cache=True)
-                        logits  = cout.logits[:, :-1, :].float()
-                        targets = cont_ids[:, 1:].contiguous()
-                        loss    = F.cross_entropy(logits.reshape(-1, logits.shape[-1]),
-                                                  targets.reshape(-1))
-                        ppl     = torch.exp(loss).item()
+                    evict_pct = cfg["evict_pct"]
+                    torch.cuda.empty_cache()
 
-                    del kv, cout, logits, targets, attn_full
+                    try:
+                        with torch.no_grad():
+                            pout = model(prefix_ids, use_cache=True)
+                            kv   = pout.past_key_values
 
-                    if math.isnan(ppl) or math.isinf(ppl):
-                        print(f"  {cfg['name']:<14s} DEGENERATE (nan/inf)")
+                        mem_pre_compress  = torch.cuda.memory_allocated() / 1e9
+                        keep_mask         = build_keep_mask(prefix_len, evict_pct, importance)
+                        info, kv          = evict_quantize(kv, keep_mask, prefix_len)
+                        mem_post_compress = torch.cuda.memory_allocated() / 1e9
+                        mem_delta_gb      = mem_post_compress - mem_pre_compress
+
+                        # Attention mask: 0 for evicted positions in prefix, 1 elsewhere
+                        attn_ctx  = torch.ones(prefix_len, dtype=torch.long, device="cuda")
+                        attn_ctx[~keep_mask] = 0
+                        attn_cont = torch.ones(cont_len, dtype=torch.long, device="cuda")
+                        attn_full = torch.cat([attn_ctx, attn_cont]).unsqueeze(0)
+
+                        with torch.no_grad():
+                            cout    = model(cont_ids, past_key_values=kv,
+                                            attention_mask=attn_full, use_cache=True)
+                            logits  = cout.logits[:, :-1, :].float()
+                            targets = cont_ids[:, 1:].contiguous()
+                            loss    = F.cross_entropy(logits.reshape(-1, logits.shape[-1]),
+                                                      targets.reshape(-1))
+                            ppl     = torch.exp(loss).item()
+
+                        del kv, cout, logits, targets, attn_full
+
+                        if math.isnan(ppl) or math.isinf(ppl):
+                            print(f"  {scorer_name:<8s} {cfg['name']:<14s} DEGENERATE (nan/inf)")
+                            torch.cuda.empty_cache()
+                            continue
+
+                        delta = ((ppl - baseline_ppl) / baseline_ppl) * 100
+                        print(f"  {scorer_name:<8s} {cfg['name']:<14s} {ppl:8.4f} "
+                              f"{delta:>+8.2f}% {info['ratio']:6.2f}x "
+                              f"{info['n_kept']:5d} {mem_delta_gb:>+9.2f}GB")
+
+                        all_results.append({
+                            "source":       source,
+                            "prefix_len":   prefix_len,
+                            "cont_len":     cont_len,
+                            "scorer":       scorer_name,
+                            "evict_pct":    evict_pct,
+                            "baseline_ppl": baseline_ppl,
+                            "ppl":          ppl,
+                            "delta":        delta,
+                            "ratio":        info["ratio"],
+                            "n_kept":       info["n_kept"],
+                            "fp16_bytes":   info["fp16"],
+                            "idx_bytes":    info["idx"],
+                            "scale_bytes":  info["scale"],
+                            "mask_bytes":   info["mask"],
+                            "total_bytes":  info["total"],
+                            "mem_delta_gb": mem_delta_gb,
+                        })
+
+                    except torch.cuda.OutOfMemoryError:
+                        print(f"  {scorer_name:<8s} {cfg['name']:<14s} OOM — skipping")
                         torch.cuda.empty_cache()
+                        gc.collect()
                         continue
 
-                    delta = ((ppl - baseline_ppl) / baseline_ppl) * 100
-                    print(f"  {cfg['name']:<14s} {ppl:8.4f} {delta:>+8.2f}% "
-                          f"{info['ratio']:6.2f}x {info['n_kept']:5d} "
-                          f"{mem_delta_gb:>+9.2f}GB")
-
-                    all_results.append({
-                        "source":       source,
-                        "prefix_len":   prefix_len,
-                        "cont_len":     cont_len,
-                        "evict_pct":    evict_pct,
-                        "baseline_ppl": baseline_ppl,
-                        "ppl":          ppl,
-                        "delta":        delta,
-                        "ratio":        info["ratio"],
-                        "n_kept":       info["n_kept"],
-                        "fp16_bytes":   info["fp16"],
-                        "idx_bytes":    info["idx"],
-                        "scale_bytes":  info["scale"],
-                        "mask_bytes":   info["mask"],
-                        "total_bytes":  info["total"],
-                        "mem_delta_gb": mem_delta_gb,
-                    })
-
-                except torch.cuda.OutOfMemoryError:
-                    print(f"  {cfg['name']:<14s} OOM — skipping")
-                    torch.cuda.empty_cache()
-                    gc.collect()
-                    continue
+            # Side-by-side scorer comparison for this prefix (if both ran)
+            if importance_real is not None:
+                kk_rows   = [r for r in all_results
+                             if r["source"] == source and r["prefix_len"] == prefix_len
+                             and r["scorer"] == "key-key"]
+                real_rows = [r for r in all_results
+                             if r["source"] == source and r["prefix_len"] == prefix_len
+                             and r["scorer"] == "real"]
+                if kk_rows and real_rows:
+                    print(f"\n  SCORER COMPARISON  prefix={prefix_len}  source={source}")
+                    print(f"  {'Evict%':>7s}  {'key-key PPL':>12s}  {'real PPL':>10s}  "
+                          f"{'diff (pp)':>11s}  {'verdict':>8s}")
+                    print(f"  {'-'*58}")
+                    for ep in sorted(set(r["evict_pct"] for r in kk_rows)):
+                        kk_r  = next((r for r in kk_rows  if r["evict_pct"] == ep), None)
+                        re_r  = next((r for r in real_rows if r["evict_pct"] == ep), None)
+                        if kk_r and re_r:
+                            diff    = re_r["ppl"] - kk_r["ppl"]
+                            verdict = "BETTER" if diff < 0 else "worse"
+                            print(f"  {ep:>6}%   {kk_r['ppl']:>10.4f} ({kk_r['delta']:+.2f}%)"
+                                  f"  {re_r['ppl']:>8.4f} ({re_r['delta']:+.2f}%)"
+                                  f"  {diff:>+9.4f}  [{verdict}]")
 
             torch.cuda.empty_cache()
             gc.collect()
 
     # ------------------------------------------------------------------ Aggregate stats
+    all_scorers = sorted(set(r.get("scorer", "key-key") for r in all_results))
+
     print(f"\n{'='*80}")
     print("AGGREGATE RESULTS — mean ± std across texts")
     print(f"{'='*80}")
@@ -674,23 +785,50 @@ def run_8k_16k_validation():
         if not prefix_rows:
             continue
 
-        print(f"\n## Prefix = {prefix_len} tokens  "
-              f"({len(set(r['source'] for r in prefix_rows))} texts)")
-        print(f"\n| Config | PPL Delta% (mean) | PPL Delta% (std) | Ratio (mean) | Ratio (std) |")
-        print(f"|--------|-------------------|------------------|--------------|-------------|")
+        n_texts = len(set(r["source"] for r in prefix_rows))
+        print(f"\n## Prefix = {prefix_len} tokens  ({n_texts} texts)")
 
-        evict_pcts = sorted(set(r["evict_pct"] for r in prefix_rows))
-        for evict_pct in evict_pcts:
-            rows   = [r for r in prefix_rows if r["evict_pct"] == evict_pct]
-            deltas = [r["delta"] for r in rows]
-            ratios = [r["ratio"] for r in rows]
-            d_mean = float(np.mean(deltas))
-            d_std  = float(np.std(deltas)) if len(deltas) > 1 else 0.0
-            r_mean = float(np.mean(ratios))
-            r_std  = float(np.std(ratios)) if len(ratios) > 1 else 0.0
-            name   = f"{evict_pct}%evict" if evict_pct > 0 else "baseline"
-            print(f"| {name:<12s} | {d_mean:>+16.2f}% | {d_std:>15.2f}% | "
-                  f"{r_mean:>11.2f}x | {r_std:>10.2f}x |")
+        for scorer_name in all_scorers:
+            scorer_rows = [r for r in prefix_rows if r.get("scorer", "key-key") == scorer_name]
+            if not scorer_rows:
+                continue
+            print(f"\n  Scorer: {scorer_name}")
+            print(f"  | Config       | PPL Delta% mean | PPL Delta% std | Ratio mean | Ratio std |")
+            print(f"  |--------------|----------------|----------------|------------|-----------|")
+            evict_pcts = sorted(set(r["evict_pct"] for r in scorer_rows))
+            for evict_pct in evict_pcts:
+                rows   = [r for r in scorer_rows if r["evict_pct"] == evict_pct]
+                deltas = [r["delta"] for r in rows]
+                ratios = [r["ratio"] for r in rows]
+                d_mean = float(np.mean(deltas))
+                d_std  = float(np.std(deltas)) if len(deltas) > 1 else 0.0
+                r_mean = float(np.mean(ratios))
+                r_std  = float(np.std(ratios)) if len(ratios) > 1 else 0.0
+                name   = f"{evict_pct}%evict" if evict_pct > 0 else "baseline"
+                print(f"  | {name:<12s} | {d_mean:>+14.2f}% | {d_std:>14.2f}% | "
+                      f"{r_mean:>10.2f}x | {r_std:>9.2f}x |")
+
+        # Cross-scorer comparison table (if both ran)
+        if len(all_scorers) > 1 and "key-key" in all_scorers and "real" in all_scorers:
+            kk_rows   = [r for r in prefix_rows if r.get("scorer", "key-key") == "key-key"]
+            real_rows = [r for r in prefix_rows if r.get("scorer", "key-key") == "real"]
+            if kk_rows and real_rows:
+                print(f"\n  SCORER DELTA (real − key-key, mean across texts):")
+                print(f"  | Evict% | key-key delta% | real delta% | diff (pp) | verdict |")
+                print(f"  |--------|----------------|-------------|-----------|---------|")
+                for ep in sorted(set(r["evict_pct"] for r in kk_rows)):
+                    kk_ep   = [r for r in kk_rows   if r["evict_pct"] == ep]
+                    real_ep = [r for r in real_rows if r["evict_pct"] == ep]
+                    if not kk_ep or not real_ep:
+                        continue
+                    kk_d   = float(np.mean([r["delta"] for r in kk_ep]))
+                    re_d   = float(np.mean([r["delta"] for r in real_ep]))
+                    kk_p   = float(np.mean([r["ppl"]   for r in kk_ep]))
+                    re_p   = float(np.mean([r["ppl"]   for r in real_ep]))
+                    diff   = re_p - kk_p
+                    verdict = "BETTER" if diff < 0 else "worse"
+                    print(f"  | {ep}%     | {kk_d:>+12.2f}% | {re_d:>+9.2f}% | "
+                          f"{diff:>+7.4f}pp | {verdict:>7s} |")
 
     # Full per-text breakdown
     print(f"\n{'='*80}")
@@ -706,13 +844,14 @@ def run_8k_16k_validation():
             pl_rows = [r for r in src_rows if r["prefix_len"] == pl]
             if not pl_rows:
                 continue
-            baseline_ppl = pl_rows[0]["baseline_ppl"]
-            print(f"  prefix={pl}  baseline_ppl={baseline_ppl:.4f}")
-            print(f"  {'Evict%':<10s} {'PPL':>8s} {'Delta%':>9s} {'Ratio':>7s} "
-                  f"{'Kept':>6s} {'idx_MB':>7s} {'scale_MB':>9s} {'mask_B':>7s}")
-            for r in sorted(pl_rows, key=lambda x: x["evict_pct"]):
+            baseline_ppl_val = pl_rows[0]["baseline_ppl"]
+            print(f"  prefix={pl}  baseline_ppl={baseline_ppl_val:.4f}")
+            print(f"  {'Scorer':<8s} {'Evict%':<10s} {'PPL':>8s} {'Delta%':>9s} "
+                  f"{'Ratio':>7s} {'Kept':>6s} {'idx_MB':>7s} {'scale_MB':>9s} {'mask_B':>7s}")
+            for r in sorted(pl_rows, key=lambda x: (x.get("scorer", "key-key"), x["evict_pct"])):
                 ep_str = f"{r['evict_pct']}%"
-                print(f"  {ep_str:<10s} {r['ppl']:8.4f} {r['delta']:>+8.2f}% "
+                sname  = r.get("scorer", "key-key")
+                print(f"  {sname:<8s} {ep_str:<10s} {r['ppl']:8.4f} {r['delta']:>+8.2f}% "
                       f"{r['ratio']:6.2f}x {r['n_kept']:5d} "
                       f"{r['idx_bytes']/1e6:6.2f}MB "
                       f"{r['scale_bytes']/1e6:8.2f}MB "
@@ -733,14 +872,17 @@ def run_8k_16k_validation():
         if not prefix_rows:
             continue
         print(f"8K/16K (prefix={prefix_len}):")
-        for evict_pct in [35, 60, 80]:
-            rows = [r for r in prefix_rows if r["evict_pct"] == evict_pct]
-            if not rows:
-                continue
-            d_mean = np.mean([r["delta"] for r in rows])
-            r_mean = np.mean([r["ratio"] for r in rows])
-            n_txt  = len(rows)
-            print(f"  {evict_pct}%evict → {r_mean:.1f}x  at {d_mean:+.2f}% PPL  (n={n_txt} texts)")
+        for scorer_name in all_scorers:
+            s_rows = [r for r in prefix_rows if r.get("scorer", "key-key") == scorer_name]
+            for evict_pct in [35, 60, 80]:
+                rows = [r for r in s_rows if r["evict_pct"] == evict_pct]
+                if not rows:
+                    continue
+                d_mean = np.mean([r["delta"] for r in rows])
+                r_mean = np.mean([r["ratio"] for r in rows])
+                n_txt  = len(rows)
+                print(f"  [{scorer_name}] {evict_pct}%evict → {r_mean:.1f}x  "
+                      f"at {d_mean:+.2f}% PPL  (n={n_txt} texts)")
 
     peak_mem = torch.cuda.max_memory_allocated() / 1e9
     print(f"\nPeak GPU memory: {peak_mem:.2f} GB")

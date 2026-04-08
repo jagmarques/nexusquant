@@ -1,6 +1,6 @@
-"""NexusQuant validation on Llama-3-70B (or Llama-2-70B fallback) — A100-80GB.
+"""NexusQuant validation on Llama-3-70B (or Llama-2-70B / Qwen2.5-72B fallback) — A100-80GB.
 
-Model fits in 80GB via 4-bit bitsandbytes weight quantization (~35GB).
+Model fits in 80GB via 4-bit bitsandbytes weight quantization (~44GB NF4).
 KV cache is kept in FP16 and compressed by NexusQuant independently.
 
 Test matrix (K2V2 and K3V2 at 35% and 60% eviction, with boundary protection):
@@ -14,7 +14,7 @@ Test matrix (K2V2 and K3V2 at 35% and 60% eviction, with boundary protection):
   - K3V2+boundary 35%: above + protect first/last 2 layers at FP16
   - K3V2+boundary 60%: above + protect first/last 2 layers at FP16
 
-Prefix: ~2000 tokens (conservative to avoid OOM on 70B + KV overhead).
+Prefix: ~3000 tokens (NF4 weights ~44GB + KV cache at 3000 tokens ~9.75GB = ~54GB, fits 80GB).
 Continuation: 200 tokens for PPL measurement.
 
 Overhead accounting (BRUTAL HONESTY):
@@ -82,10 +82,11 @@ def run_70b():
 
     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-    # Try Llama-3-70B first, fall back to Llama-2-70B
+    # Try Llama-3-70B first, then Llama-2-70B, then Qwen2.5-72B
     CANDIDATES = [
         "meta-llama/Meta-Llama-3-70B",
         "meta-llama/Llama-2-70b-hf",
+        "Qwen/Qwen2.5-72B",
     ]
     model = None
     model_name = None
@@ -128,6 +129,7 @@ def run_70b():
     n_layers   = model.config.num_hidden_layers
     n_kv_heads = model.config.num_key_value_heads
     head_dim   = model.config.hidden_size // model.config.num_attention_heads
+    # rope_theta is read from config automatically — Qwen2.5 uses 1,000,000 vs Llama's 500,000/10,000
     rope_base  = getattr(model.config, "rope_theta", 10000.0)
     print(f"\nConfig: {n_layers}L, {n_kv_heads} KV-heads, head_dim={head_dim}, rope_base={rope_base}")
 
@@ -338,7 +340,7 @@ def run_70b():
     full_ids = inputs.input_ids.to("cuda")
     n_tok = full_ids.shape[1]
 
-    TARGET_PREFIX = 2000
+    TARGET_PREFIX = 3000
     CONT_LEN = 200
     prefix_len = min(TARGET_PREFIX, n_tok - CONT_LEN)
 
