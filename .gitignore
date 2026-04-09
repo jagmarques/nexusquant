@@ -26,6 +26,14 @@ dist/
 *.synctex.gz
 paper/*.png
 
+# Paper — only final compiled PDF (nexusquant.pdf) goes to git
+paper/*.tex
+paper/*.bib
+paper/*.sty
+paper/*.md
+paper/*.py
+paper/fig*.pdf
+
 .DS_Store
 
-experiments/_archive/
+experiments/

@@ -33,6 +33,23 @@ with nexusquant_evict(model, quality="balanced"):
     output = model.generate(input_ids, max_new_tokens=512)
 ```
 
+## Three-tier compression
+
+| Tier | What it does | Compression | PPL impact | NIAH recall | Use case |
+|---|---|---|---|---|---|
+| Quant-only | E8 lattice VQ, no eviction | ~4x | ~0% (lossless) | 100% | Quality-critical apps |
+| Light eviction | E8 VQ + 25% eviction (real scorer) | ~5.3x | +0.20% | 100% | Balanced quality + compression |
+| Aggressive eviction | E8 VQ + 35-80% eviction | 8-33x | +0.3-5% | 0% | Memory-critical ("fits vs doesn't fit") |
+
+The NIAH cliff is sharp: factual recall is 100% at 25% eviction and drops to 0% at 35%. Light eviction with the real attention scorer is the sweet spot for most deployments.
+
+```python
+from nexusquant import compress_kv_cache
+
+# Lossless ~5x compression, NIAH preserved
+compressed_kv = compress_kv_cache(past_key_values, mode="quant_only", rope_base=10000.0)
+```
+
 ## Why
 
 | Without NexusQuant | With NexusQuant |
@@ -53,20 +70,20 @@ Measured on Mistral-7B, Phi-3-mini, Qwen2.5-7B. Compression ratios include all o
 | `balanced` | ~17x | ~1.3% | K2V2 + 60% evict |
 | `max` | ~33x | +0.66% | K2V2 + real scorer + 80% evict |
 
-**Important: PPL alone does not tell the full quality story.** Our NIAH (needle-in-a-haystack) tests show 40% factual recall at K3V2-35% despite only +0.82% PPL. The key-key scorer can evict early-context tokens containing critical facts. Multi-window scoring (first-16 + last-16 queries) improves NIAH to 80% and PPL to +0.57% at 35% eviction. See Limitations below.
+**Important: PPL alone does not tell the full quality story.** Eviction modes show 40% NIAH recall at K3V2-35% despite only +0.82% PPL. Quant-only mode (~5x) preserves NIAH recall fully. Use quant-only when factual accuracy matters more than compression ratio. See Limitations below.
 
 Attention sharpening (scaling keys by sqrt(1.05) after quantization) gives a free +0.05pp quality improvement at zero compression cost. Enabled by default.
 
 ### Cross-architecture results (Cerebrium A10)
 
-| Model | K2V2 35% | K3V2 35% | K2V2 60% | K3V2 60% |
+| Model | KV Heads | K3V2 35% | K2V2 35% | Notes |
 |---|---|---|---|---|
-| Mistral-7B (GQA 8:1) | +0.91% | +0.82% | +1.64% | +1.22% |
-| Phi-3-mini (d=96) | +0.82% | +0.59% | +2.81% | +1.10% |
-| Qwen2.5-7B | catastrophic | catastrophic | catastrophic | catastrophic |
-| Qwen2.5-7B + boundary(2) | +7.9% | +8.7% | +23.8% | +23.3% |
+| Gemma-2-2b-it | 4 | +0.05% | +0.35% | Best result. Large head_dim (256) helps. |
+| Mistral-7B | 8 | +0.82% | +0.91% | Main benchmark. |
+| Qwen2.5-1.5B | 2 | +5.04% | +28.7% | 2 KV heads = danger zone. boundary=1 mandatory. |
+| Gemma 4-E2B | 1 | +54% | +54% | 1 KV head, heterogeneous head_dim (256/512). |
 
-> **Note:** Qwen-family models require `protect_boundary=2` (first/last 2 layers at FP16). Mistral and Phi-3 work without it.
+> **Pattern:** More KV heads = more compression-tolerant. Models with 1-2 KV heads need `protect_boundary=1` at minimum. Models with 1 KV head are compression-hostile.
 
 ## How it works
 
