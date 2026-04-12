@@ -375,12 +375,13 @@ class NexusQuantMax:
 
         reconstructed = res @ pca_dict[layer_idx]["Vh"] + pca_dict[layer_idx]["mean"]
 
+        target_dtype = val.dtype
         if is_keys:
             recon_heads = reconstructed.reshape(h, seq, d)
             recon_heads = forward_rope(recon_heads)
-            return recon_heads.unsqueeze(0).half().to(val.device)
+            return recon_heads.unsqueeze(0).to(dtype=target_dtype, device=val.device)
         else:
-            return reconstructed.reshape(b, h, seq, d).half().to(val.device)
+            return reconstructed.reshape(b, h, seq, d).to(dtype=target_dtype, device=val.device)
 
     def compress(self, past_key_values) -> Any:
         """Compress KV cache using DP + RoPE removal + E8."""
@@ -390,8 +391,11 @@ class NexusQuantMax:
         n_layers = _num_layers(past_key_values)
         for l in range(n_layers):
             k, v = _get_layer_kv(past_key_values, l)
+            orig_dtype = k.dtype
             k_compressed = self._compress_tensor(k.float(), self.pca_k, self.alloc_k, l, is_keys=True)
             v_compressed = self._compress_tensor(v.float(), self.pca_v, self.alloc_v, l, is_keys=False)
+            k_compressed = k_compressed.to(dtype=orig_dtype)
+            v_compressed = v_compressed.to(dtype=orig_dtype)
             _set_layer_kv(past_key_values, l, k_compressed, v_compressed)
 
         return past_key_values
