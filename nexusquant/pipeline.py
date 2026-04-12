@@ -181,11 +181,42 @@ class NexusQuantQuantOnly:
         compressed_kv = nq.compress(past_key_values)
     """
 
-    def __init__(self, bits: int = 3, rope_base: float = 10000.0):
+    def __init__(self, bits: int = 3, rope_base: float = 10000.0,
+                 compress_layers: str = "all"):
         self.bits = bits
         self.levels = 2 ** bits
         self.rope_base = rope_base
+        self.compress_layers = compress_layers
         self._hadamard_cache = {}
+        self._swa_layer_indices = None
+
+    def set_model_config(self, model_config):
+        """Detect SWA layers for hybrid models (Gemma 4, GLM4).
+
+        When compress_layers="global_only", SWA layers are kept at f16.
+        Mirrors NexusQuantEvict.set_model_config().
+        """
+        if self.compress_layers != "global_only":
+            return
+        # Gemma 4 nests text config inside text_config; unwrap if present
+        cfg = getattr(model_config, 'text_config', model_config)
+        swa_layers = set()
+        n_layers = getattr(cfg, 'num_hidden_layers', 32)
+        pattern = getattr(cfg, 'sliding_window_pattern', None)
+        if pattern is not None:
+            for i in range(n_layers):
+                if (i + 1) % pattern != 0:
+                    swa_layers.add(i)
+        layer_types = getattr(cfg, 'layer_types', None)
+        if layer_types is not None and not swa_layers:
+            for i, lt in enumerate(layer_types):
+                if lt in ('sliding_window', 'local', 'swa', 'sliding_attention'):
+                    swa_layers.add(i)
+        n_shared = getattr(cfg, 'num_kv_shared_layers', 0)
+        if n_shared > 0 and not swa_layers:
+            for i in range(n_layers - n_shared, n_layers):
+                swa_layers.add(i)
+        self._swa_layer_indices = swa_layers
 
     def _get_hadamard(self, size: int, device) -> torch.Tensor:
         if size not in self._hadamard_cache:
@@ -199,7 +230,10 @@ class NexusQuantQuantOnly:
     def compress(self, past_key_values) -> Any:
         """Compress KV cache in-place: RoPE removal + Hadamard + E8 + re-RoPE. No eviction."""
         n_layers = _num_layers(past_key_values)
+        skip_layers = self._swa_layer_indices or set()
         for l in range(n_layers):
+            if l in skip_layers:
+                continue
             k, v = _get_layer_kv(past_key_values, l)
             k = k.float()
             v = v.float()
@@ -627,30 +661,30 @@ class NexusQuantEvict:
         if self.compress_layers != "global_only":
             return
 
+        # Gemma 4 nests text config inside text_config; unwrap if present
+        cfg = getattr(model_config, 'text_config', model_config)
+
         # Detect SWA layers from config
-        # Gemma4: config.sliding_window_pattern or per-layer attention type
         swa_layers = set()
-        n_layers = getattr(model_config, 'num_hidden_layers', 32)
+        n_layers = getattr(cfg, 'num_hidden_layers', 32)
 
         # Method 1: sliding_window_pattern (Gemma4 style)
-        pattern = getattr(model_config, 'sliding_window_pattern', None)
+        pattern = getattr(cfg, 'sliding_window_pattern', None)
         if pattern is not None:
-            # pattern is typically an int: every Nth layer is global, rest are SWA
             for i in range(n_layers):
-                if (i + 1) % pattern != 0:  # non-global layers are SWA
+                if (i + 1) % pattern != 0:
                     swa_layers.add(i)
 
-        # Method 2: layer_types list (some models)
-        layer_types = getattr(model_config, 'layer_types', None)
+        # Method 2: layer_types list (Gemma 4 E2B uses this)
+        layer_types = getattr(cfg, 'layer_types', None)
         if layer_types is not None and not swa_layers:
             for i, lt in enumerate(layer_types):
-                if lt in ('sliding_window', 'local', 'swa'):
+                if lt in ('sliding_window', 'local', 'swa', 'sliding_attention'):
                     swa_layers.add(i)
 
         # Method 3: num_kv_shared_layers (Gemma4 E-series)
-        n_shared = getattr(model_config, 'num_kv_shared_layers', 0)
+        n_shared = getattr(cfg, 'num_kv_shared_layers', 0)
         if n_shared > 0 and not swa_layers:
-            # Shared layers reuse KV from earlier layers, skip them
             for i in range(n_layers - n_shared, n_layers):
                 swa_layers.add(i)
 
