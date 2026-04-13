@@ -114,11 +114,12 @@ class NexusQuantSimple:
     """
 
     def __init__(self, head_dim: int = 128, bits: int = 3, rope_base: float = 10000.0,
-                 merge_pct: float = 0.0):
+                 rope_scaling: dict = None, merge_pct: float = 0.0):
         self.head_dim = head_dim
         self.bits = bits
         self.levels = 2 ** bits
         self.rope_base = rope_base
+        self.rope_scaling = rope_scaling
         self.merge_pct = merge_pct
         self.H = hadamard_matrix(head_dim)
 
@@ -141,7 +142,7 @@ class NexusQuantSimple:
             k_out_list = []
             v_list = [v[bi] for bi in range(b)]  # split values per batch for merge_pct
             for bi in range(b):
-                k_nr = inverse_rope(k[bi], base=self.rope_base)  # (h, seq, d)
+                k_nr = inverse_rope(k[bi], base=self.rope_base, rope_scaling=self.rope_scaling)  # (h, seq, d)
                 if self.merge_pct > 0:
                     k_nr, v_merged = merge_and_drop(k_nr, v_list[bi], self.merge_pct)
                     v_list[bi] = v_merged
@@ -150,7 +151,7 @@ class NexusQuantSimple:
                 k_flat = k_rot.reshape(-1, k_rot.shape[-1])
                 k_q = E8Lattice.quantize_perhead(k_flat, levels=self.levels)
                 k_back = torch.einsum('hsd,ed->hse', k_q.reshape(k_rot.shape), self.H.float())
-                k_roped = forward_rope(k_back, base=self.rope_base)  # (h, seq, d)
+                k_roped = forward_rope(k_back, base=self.rope_base, rope_scaling=self.rope_scaling)  # (h, seq, d)
                 k_out_list.append(k_roped)
             k_out = torch.stack(k_out_list, dim=0).half().to(device)
 
@@ -182,10 +183,11 @@ class NexusQuantQuantOnly:
     """
 
     def __init__(self, bits: int = 3, rope_base: float = 10000.0,
-                 compress_layers: str = "all"):
+                 rope_scaling: dict = None, compress_layers: str = "all"):
         self.bits = bits
         self.levels = 2 ** bits
         self.rope_base = rope_base
+        self.rope_scaling = rope_scaling
         self.compress_layers = compress_layers
         self._hadamard_cache = {}
         self._swa_layer_indices = None
@@ -244,12 +246,12 @@ class NexusQuantQuantOnly:
             # Keys: RoPE removal -> Hadamard -> E8 per-head -> inv Hadamard -> re-RoPE
             k_out_list = []
             for bi in range(b):
-                k_nr = inverse_rope(k[bi], base=self.rope_base)
+                k_nr = inverse_rope(k[bi], base=self.rope_base, rope_scaling=self.rope_scaling)
                 k_rot = torch.einsum('hsd,de->hse', k_nr, H)
                 k_flat = k_rot.reshape(-1, d)
                 k_q = E8Lattice.quantize_perhead(k_flat, levels=self.levels)
                 k_back = torch.einsum('hsd,ed->hse', k_q.reshape(h, seq, d), H)
-                k_out_list.append(forward_rope(k_back, base=self.rope_base))
+                k_out_list.append(forward_rope(k_back, base=self.rope_base, rope_scaling=self.rope_scaling))
             k_out = torch.stack(k_out_list, dim=0).half().to(device)
 
             # Values: Hadamard -> E8 per-head -> inv Hadamard
@@ -288,6 +290,7 @@ class NexusQuantMax:
         self.H = hadamard_matrix(head_dim)
         self.n_layers = model.config.num_hidden_layers
         self.rope_base = getattr(model.config, 'rope_theta', 10000.0)
+        self.rope_scaling = getattr(model.config, 'rope_scaling', None)
         self.pca_k: Dict[int, Dict] = {}
         self.pca_v: Dict[int, Dict] = {}
         self.alloc_k: Dict[int, list] = {}
@@ -322,7 +325,7 @@ class NexusQuantMax:
             for l in range(n_layers_out):
                 k_tensor, v_tensor = _get_layer_kv(pkv, l)
                 k = k_tensor[0].float().cpu()
-                k_nr = inverse_rope(k)
+                k_nr = inverse_rope(k, base=self.rope_base, rope_scaling=self.rope_scaling)
                 key_data[l].append(k_nr.reshape(-1, self.head_dim))
                 val_data[l].append(v_tensor[0].float().cpu().reshape(-1, self.head_dim))
 
@@ -347,7 +350,7 @@ class NexusQuantMax:
         raw = val[0]  # (h, seq, d)
 
         if is_keys:
-            processed = inverse_rope(raw).reshape(h * seq, d).cpu().float()
+            processed = inverse_rope(raw, base=self.rope_base, rope_scaling=self.rope_scaling).reshape(h * seq, d).cpu().float()
         else:
             processed = raw.reshape(h * seq, d).cpu().float()
 
@@ -378,7 +381,7 @@ class NexusQuantMax:
         target_dtype = val.dtype
         if is_keys:
             recon_heads = reconstructed.reshape(h, seq, d)
-            recon_heads = forward_rope(recon_heads)
+            recon_heads = forward_rope(recon_heads, base=self.rope_base, rope_scaling=self.rope_scaling)
             return recon_heads.unsqueeze(0).to(dtype=target_dtype, device=val.device)
         else:
             return reconstructed.reshape(b, h, seq, d).to(dtype=target_dtype, device=val.device)
@@ -427,6 +430,7 @@ class NexusQuantAsymmetric:
         self.n_calibration = n_calibration
         self.n_layers = model.config.num_hidden_layers
         self.rope_base = getattr(model.config, 'rope_theta', 10000.0)
+        self.rope_scaling = getattr(model.config, 'rope_scaling', None)
         self.pca_k: Dict[int, Dict] = {}
         self.pca_v: Dict[int, Dict] = {}
         self.keep_k: Dict[int, int] = {}
@@ -454,7 +458,7 @@ class NexusQuantAsymmetric:
             for l in range(_num_layers(pkv)):
                 k_t, v_t = _get_layer_kv(pkv, l)
                 k = k_t[0].float().cpu()
-                k_nr = inverse_rope(k, base=self.rope_base)
+                k_nr = inverse_rope(k, base=self.rope_base, rope_scaling=self.rope_scaling)
                 key_data[l].append(k_nr.reshape(-1, self.head_dim))
                 val_data[l].append(v_t[0].float().cpu().reshape(-1, self.head_dim))
 
@@ -488,7 +492,7 @@ class NexusQuantAsymmetric:
         levels = 2 ** self.bits
 
         if is_keys:
-            processed = inverse_rope(raw, base=self.rope_base).reshape(h * seq, d).cpu().float()
+            processed = inverse_rope(raw, base=self.rope_base, rope_scaling=self.rope_scaling).reshape(h * seq, d).cpu().float()
         else:
             processed = raw.reshape(h * seq, d).cpu().float()
 
@@ -509,7 +513,7 @@ class NexusQuantAsymmetric:
 
         if is_keys:
             recon_heads = reconstructed.reshape(h, seq, d)
-            recon_heads = forward_rope(recon_heads, base=self.rope_base)
+            recon_heads = forward_rope(recon_heads, base=self.rope_base, rope_scaling=self.rope_scaling)
             return recon_heads.unsqueeze(0).half().to(val.device)
         else:
             return reconstructed.reshape(b, h, seq, d).half().to(val.device)
@@ -552,6 +556,7 @@ class NexusQuantEvict:
         sliding_window: int = 32,
         obs_window: int = 32,
         rope_base: float = 10000.0,
+        rope_scaling: dict = None,
         scorer: str = "key-key",
         protected_layers: set = None,
         protect_boundary: Union[int, str] = 0,
@@ -639,6 +644,7 @@ class NexusQuantEvict:
         self.sliding_window = sliding_window
         self.obs_window = obs_window
         self.rope_base = rope_base
+        self.rope_scaling = rope_scaling
         self.scorer = scorer
         self.protected_layers = set(protected_layers) if protected_layers else set()
         self.protect_boundary = protect_boundary  # int or "auto"
@@ -1001,6 +1007,7 @@ class NexusQuantEvict:
         prefix_attention_mask = keep_mask.float()                 # (b, seq)
 
         rope_base = self.rope_base
+        rope_scaling = self.rope_scaling
 
         # --- Feature 3: Resolve boundary protection (fixed int or "auto") ---
         if self.protect_boundary == "auto":
@@ -1051,7 +1058,7 @@ class NexusQuantEvict:
                 k_out_batches = []
                 for bi in range(b):
                     k_bi = k[bi]                                                                  # (h_l, seq_l, d_l)
-                    k_nr = inverse_rope(k_bi, base=rope_base)                                     # (h_l, seq_l, d_l)
+                    k_nr = inverse_rope(k_bi, base=rope_base, rope_scaling=rope_scaling)                                     # (h_l, seq_l, d_l)
                     k_rot = torch.einsum('hsd,de->hse', k_nr, H)                                 # (h_l, seq_l, d_l)
                     k_flat = k_rot.reshape(-1, d_l)                                               # (h_l*seq_l, d_l)
                     k_q_full = E8Lattice.quantize_perhead(k_flat, levels=lkl)
@@ -1059,7 +1066,7 @@ class NexusQuantEvict:
                     keep_flat = mask_4d_l[bi].expand(h_l, seq_l, 1).reshape(h_l * seq_l, 1)
                     k_q = k_q_full * keep_flat + k_q_1bit * (1.0 - keep_flat)
                     k_back = torch.einsum('hsd,ed->hse', k_q.reshape(h_l, seq_l, d_l), H)
-                    k_roped = forward_rope(k_back, base=rope_base)
+                    k_roped = forward_rope(k_back, base=rope_base, rope_scaling=rope_scaling)
                     k_out_batches.append(k_roped)
                 k_out = torch.stack(k_out_batches, dim=0).to(dtype=torch.float16, device=device)
 
@@ -1110,12 +1117,12 @@ class NexusQuantEvict:
             k_out_batches = []
             for bi in range(b):
                 k_bi = k[bi]  # (h_l, seq_l, d_l)
-                k_nr = inverse_rope(k_bi, base=rope_base)
+                k_nr = inverse_rope(k_bi, base=rope_base, rope_scaling=rope_scaling)
                 k_rot = torch.einsum('hsd,de->hse', k_nr, H)
                 k_flat = k_rot.reshape(-1, d_l)
                 k_q = E8Lattice.quantize_perhead(k_flat, levels=lkl)
                 k_back = torch.einsum('hsd,ed->hse', k_q.reshape(h_l, seq_l, d_l), H)
-                k_roped = forward_rope(k_back, base=rope_base)
+                k_roped = forward_rope(k_back, base=rope_base, rope_scaling=rope_scaling)
                 k_out_batches.append(k_roped)
             k_out = torch.stack(k_out_batches, dim=0).to(dtype=torch.float16, device=device)
 
@@ -1216,6 +1223,7 @@ class NexusQuantEvictTruncate(NexusQuantEvict):
         new_positions = torch.arange(n_kept, dtype=torch.float32, device=device)
 
         rope_base = self.rope_base
+        rope_scaling = self.rope_scaling
 
         # --- Feature 3: Resolve boundary protection (fixed int or "auto") ---
         if self.protect_boundary == "auto":
@@ -1270,12 +1278,12 @@ class NexusQuantEvictTruncate(NexusQuantEvict):
             k_out_batches = []
             for bi in range(b):
                 k_bi = k_kept[bi]   # (h_l, n_kept_l, d_l)
-                k_nr = inverse_rope_at_positions(k_bi, layer_orig_pos, base=rope_base)
+                k_nr = inverse_rope_at_positions(k_bi, layer_orig_pos, base=rope_base, rope_scaling=rope_scaling)
                 k_rot = torch.einsum('hsd,de->hse', k_nr, H)
                 k_flat = k_rot.reshape(-1, d_l)
                 k_q = E8Lattice.quantize_perhead(k_flat, levels=lkl)
                 k_back = torch.einsum('hsd,ed->hse', k_q.reshape(h_l, n_kept_l, d_l), H)
-                k_roped = forward_rope_at_positions(k_back, layer_new_pos, base=rope_base)
+                k_roped = forward_rope_at_positions(k_back, layer_new_pos, base=rope_base, rope_scaling=rope_scaling)
                 k_out_batches.append(k_roped)
             k_out = torch.stack(k_out_batches, dim=0).to(dtype=torch.float16, device=device)
 
@@ -1316,6 +1324,7 @@ def compress_kv_cache(past_key_values, mode: str = "simple", head_dim: int = 128
             head_dim=head_dim,
             bits=kwargs.get("bits", 3),
             rope_base=kwargs.get("rope_base", 10000.0),
+            rope_scaling=kwargs.get("rope_scaling", None),
             merge_pct=kwargs.get("merge_pct", 0.0),
         )
         return nq.compress(past_key_values)
@@ -1350,6 +1359,7 @@ def compress_kv_cache(past_key_values, mode: str = "simple", head_dim: int = 128
         nq = NexusQuantQuantOnly(
             bits=kwargs.get("bits", 3),
             rope_base=kwargs.get("rope_base", 10000.0),
+            rope_scaling=kwargs.get("rope_scaling", None),
         )
         return nq.compress(past_key_values)
     else:

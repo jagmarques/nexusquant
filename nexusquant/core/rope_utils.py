@@ -36,25 +36,39 @@ def _apply_rope_scaling(inv_freq: torch.Tensor, rope_scaling: dict) -> torch.Ten
 
     Args:
         inv_freq: Base inverse frequencies tensor (d_half,)
-        rope_scaling: Dict with keys "type" and "factor". Supported types:
+        rope_scaling: Dict with "type"/"rope_type" and "factor". Supported types:
             "linear"  -- exact: divide frequencies by factor.
             "dynamic" -- approximation: divide by factor (same as linear).
-                         Full NTK-aware base adjustment is a TODO.
+            "llama3"  -- piecewise: high-freq unchanged, low-freq scaled,
+                         mid-freq smoothly interpolated. Used by Llama 3.1+.
 
     Returns:
         Scaled inv_freq tensor, same shape.
     """
-    scaling_type = rope_scaling.get("type", "linear")
+    import math
+    scaling_type = rope_scaling.get("type", rope_scaling.get("rope_type", "linear"))
     factor = float(rope_scaling.get("factor", 1.0))
     if factor == 1.0:
         return inv_freq
     if scaling_type in ("linear", "dynamic"):
-        # Linear: exact. Dynamic/NTK-aware: approximation -- dividing frequencies
-        # by the scale factor matches linear but does not reproduce the full NTK
-        # base adjustment (base_scaled = base * factor^(dim/(dim-2))).
-        # TODO: implement true NTK base adjustment for scaling_type == "dynamic".
         return inv_freq / factor
-    # Unknown type: pass through unchanged and let the caller handle it.
+    if scaling_type == "llama3":
+        low_freq_factor = float(rope_scaling.get("low_freq_factor", 1.0))
+        high_freq_factor = float(rope_scaling.get("high_freq_factor", 4.0))
+        old_context_len = int(rope_scaling.get("original_max_position_embeddings", 8192))
+        low_freq_wavelen = old_context_len / low_freq_factor
+        high_freq_wavelen = old_context_len / high_freq_factor
+        new_freqs = []
+        for freq in inv_freq:
+            wavelen = 2.0 * math.pi / freq.item()
+            if wavelen < high_freq_wavelen:
+                new_freqs.append(freq)
+            elif wavelen > low_freq_wavelen:
+                new_freqs.append(freq / factor)
+            else:
+                smooth = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor)
+                new_freqs.append((1.0 - smooth) * freq / factor + smooth * freq)
+        return torch.stack(new_freqs)
     return inv_freq
 
 
