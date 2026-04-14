@@ -567,6 +567,7 @@ class NexusQuantEvict:
         compress_layers: str = "all",
         layer_bit_profile: str = "uniform",
         distance_graduated: bool = False,
+        merge_eviction: bool = False,
     ):
         """
         Args:
@@ -622,6 +623,13 @@ class NexusQuantEvict:
                     SWA layers have fixed memory cost regardless of context length,
                     so compressing them wastes quality for minimal savings.
                     Requires model config to be passed via set_model_config().
+            merge_eviction: When True, use MergingPress-style value merging instead
+                of hard zeroing. For each evicted token, its value vector is added
+                to the nearest surviving token (by cosine similarity in value space),
+                weighted by its importance score. This redistributes evicted
+                information before quantization rather than discarding it. The
+                returned attention mask still zeros evicted positions so the model
+                does not attend to them directly. Default False.
         """
         if scorer not in ("key-key", "real"):
             raise ValueError(f"scorer must be 'key-key' or 'real', got {scorer!r}")
@@ -655,6 +663,7 @@ class NexusQuantEvict:
         self.compress_layers = compress_layers  # "all" or "global_only"
         self.layer_bit_profile = layer_bit_profile  # "uniform" or "graduated"
         self.distance_graduated = distance_graduated  # boost recent token importance
+        self.merge_eviction = merge_eviction  # MergingPress cosine-similarity value merging
         self._swa_layer_indices = None  # cached set of SWA layer indices
         self._hadamard_cache = {}  # size -> Hadamard matrix on device
 
@@ -949,6 +958,95 @@ class NexusQuantEvict:
 
         return keep_mask
 
+    def _apply_merge_eviction(self, past_key_values, keep_mask: torch.Tensor,
+                              importance: torch.Tensor, n_layers: int) -> None:
+        """MergingPress-style value merging: redistribute evicted token values into
+        nearest surviving tokens by cosine similarity, weighted by importance score.
+
+        For each evicted position, finds the kept token whose value vector (averaged
+        across heads) has highest cosine similarity, then adds:
+            v_survivor += (imp_evicted / (imp_survivor + imp_evicted + 1e-8)) * v_evicted
+
+        Modifies past_key_values in-place (values only; keys unchanged).
+
+        Args:
+            past_key_values: DynamicCache to modify in-place.
+            keep_mask: (batch, seq) bool, True = kept token.
+            importance: (batch, seq) float importance scores.
+            n_layers: number of layers in the cache.
+        """
+        b = keep_mask.shape[0]
+        for bi in range(b):
+            km = keep_mask[bi]          # (seq,)
+            imp = importance[bi]        # (seq,)
+
+            evict_pos = (~km).nonzero(as_tuple=True)[0]   # positions to merge away
+            kept_pos  = km.nonzero(as_tuple=True)[0]       # positions that survive
+
+            if evict_pos.numel() == 0 or kept_pos.numel() == 0:
+                continue
+
+            # Compute a representative value vector per position by averaging over
+            # layers and heads. Use the first non-SWA layer's value tensor to get seq.
+            # We collect mean-value centroids once, then reuse per layer.
+            #
+            # Shape: accumulate (seq, d) across layers for cosine-sim computation.
+            centroid_sum = None
+            centroid_count = 0
+            target_seq = km.shape[0]
+
+            for l in range(n_layers):
+                _, v_l = _get_layer_kv(past_key_values, l)
+                if v_l.shape[2] != target_seq:
+                    continue  # SWA layer with shorter seq, skip
+                # v_l: (1, h, seq, d) — batch element bi
+                v_mean = v_l[bi].float().mean(dim=0)  # (seq, d)
+                if centroid_sum is None:
+                    centroid_sum = v_mean
+                else:
+                    centroid_sum = centroid_sum + v_mean
+                centroid_count += 1
+
+            if centroid_count == 0 or centroid_sum is None:
+                continue
+
+            centroids = centroid_sum / centroid_count  # (seq, d)
+
+            # Cosine similarity between evicted and kept centroids
+            evict_vecs = centroids[evict_pos]   # (n_evict, d)
+            kept_vecs  = centroids[kept_pos]    # (n_kept,  d)
+
+            evict_norm = F.normalize(evict_vecs, dim=-1)   # (n_evict, d)
+            kept_norm  = F.normalize(kept_vecs,  dim=-1)   # (n_kept,  d)
+
+            # cosine similarity matrix: (n_evict, n_kept)
+            cos_sim = torch.mm(evict_norm, kept_norm.t())
+            nearest_kept_local = cos_sim.argmax(dim=1)   # (n_evict,) index into kept_pos
+
+            # For each evicted position, merge its value into the nearest survivor
+            for l in range(n_layers):
+                k_l, v_l = _get_layer_kv(past_key_values, l)
+                if v_l.shape[2] != target_seq:
+                    continue  # skip SWA layers
+
+                v = v_l[bi].float()   # (h, seq, d)
+
+                for ei, e_pos in enumerate(evict_pos):
+                    survivor_local = nearest_kept_local[ei].item()
+                    s_pos = kept_pos[survivor_local]
+
+                    imp_e = imp[e_pos].item()
+                    imp_s = imp[s_pos].item()
+                    w = imp_e / (imp_s + imp_e + 1e-8)
+
+                    # Accumulate: survivor gets a weighted fraction of evicted value
+                    v[:, s_pos, :] = v[:, s_pos, :] + w * v[:, e_pos, :]
+
+                # Write back (only values modified; keys left as-is for now)
+                new_v = v_l.clone()
+                new_v[bi] = v.to(dtype=v_l.dtype)
+                _set_layer_kv(past_key_values, l, k_l, new_v)
+
     def compress(self, past_key_values, model=None, input_ids=None):
         """Compress KV cache in-place: evict + RoPE-rm + Hadamard + E8 + write back.
 
@@ -1083,6 +1181,10 @@ class NexusQuantEvict:
                 _set_layer_kv(past_key_values, l, k_out, v_out)
 
             return past_key_values, ones_mask
+
+        # --- Merge eviction: redistribute evicted values before zeroing ---
+        if self.merge_eviction:
+            self._apply_merge_eviction(past_key_values, keep_mask, importance, n_layers)
 
         # --- Hard eviction (default behaviour, soft_eviction=False) ---
         for l in range(n_layers):
